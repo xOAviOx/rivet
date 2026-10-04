@@ -12,12 +12,14 @@
   "packageManager": "pnpm@11.6.0",
   "files": [
     "dist",
+    "docs",
     "README.md",
     "SECURITY.md",
     "example.config.json"
   ],
   "scripts": {
-    "build": "tsc",
+    "clean": "node scripts/clean.mjs",
+    "build": "pnpm clean && tsc",
     "typecheck": "tsc --noEmit",
     "test": "pnpm build && node --test test/*.test.mjs",
     "lint": "eslint src",
