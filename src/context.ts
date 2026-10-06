@@ -1,5 +1,17 @@
-import type { Message } from "./types.js";
+import type { Message, ToolCall } from "./types.js";
 import { RivetError } from "./types.js";
+
+/** Providers reject transcripts with tool calls that have no recorded result. */
+export function unresolvedCalls(messages: Message[]): ToolCall[] {
+  const results = new Set(
+    messages.flatMap((m) => (m.role === "tool" ? [m.callId] : [])),
+  );
+  return messages.flatMap((m) =>
+    m.role === "assistant"
+      ? (m.calls ?? []).filter((call) => !results.has(call.id))
+      : [],
+  );
+}
 
 // A UTF-8 byte per token is deliberately conservative; no undocumented tokenizer is assumed.
 export const estimate = (value: unknown) =>

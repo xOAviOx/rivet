@@ -1,5 +1,5 @@
 import { configSchema, modelSchema, type Config } from "./config.js";
-import { compact, estimate } from "./context.js";
+import { compact, estimate, unresolvedCalls } from "./context.js";
 import { createProvider, probe } from "./providers.js";
 import { clean } from "./security.js";
 import {
@@ -236,17 +236,6 @@ export function resolveModel(id: string, choice: ModelChoice = {}): ModelSpec {
   if (parsed.data.maxOutput >= parsed.data.context)
     throw new RivetError("maxOutput must be smaller than context", 2);
   return parsed.data;
-}
-
-function unresolvedCalls(history: Message[]): string[] {
-  const results = new Set(
-    history.flatMap((m) => (m.role === "tool" ? [m.callId] : [])),
-  );
-  return history.flatMap((m) =>
-    m.role === "assistant"
-      ? (m.calls ?? []).filter((c) => !results.has(c.id)).map((c) => c.id)
-      : [],
-  );
 }
 
 /**

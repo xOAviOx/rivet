@@ -62,6 +62,27 @@ test("sessions, ordered messages, events, and pending actions survive restart", 
   );
 });
 
+test("completing an action writes its result and transcript message together or not at all", (t) => {
+  let store;
+  const directory = temporaryStore(t, () => store?.close());
+  store = open(directory);
+  const session = store.create(".", "test-model");
+  const call = { id: "call-1", name: "exec", arguments: {} };
+  const actionId = store.begin(session.id, call);
+  const message = { role: "tool", content: "ok", callId: "call-1" };
+  store.complete(actionId, session.id, message);
+  assert.deepEqual(store.actions(session.id), [
+    { id: actionId, call, result: "ok" },
+  ]);
+  assert.deepEqual(store.messages(session.id), [message]);
+  assert.throws(
+    () => store.complete(actionId, session.id, { ...message, content: "x" }),
+    /missing or already resolved/,
+  );
+  assert.deepEqual(store.messages(session.id), [message]);
+  assert.equal(store.actions(session.id)[0].result, "ok");
+});
+
 test("a second writer is rejected until the first store closes", (t) => {
   let first, second;
   const directory = temporaryStore(t, () => {

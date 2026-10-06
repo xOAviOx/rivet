@@ -159,6 +159,36 @@ export class Store {
       throw new RivetError("Action is missing or already resolved");
   }
 
+  /** Resolves an action and appends its result in one transaction, so a crash cannot split them. */
+  complete(actionId: string, id: string, message: Message) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.finish(actionId, message.content);
+      this.append(id, message);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  actions(id: string): Array<{
+    id: string;
+    call: ToolCall;
+    result: string | null;
+  }> {
+    return this.db
+      .prepare(
+        "SELECT id,call,result FROM actions WHERE session=? ORDER BY rowid",
+      )
+      .all(id)
+      .map((row) => ({
+        id: String(row.id),
+        call: JSON.parse(String(row.call)) as ToolCall,
+        result: row.result === null ? null : String(row.result),
+      }));
+  }
+
   /** Unfinished actions require user reconciliation; this store never replays them. */
   pending(id: string): Array<{ id: string; call: ToolCall }> {
     return this.db
