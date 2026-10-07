@@ -8,7 +8,8 @@ export type ExportStore = Pick<
   "get" | "messages" | "events" | "pending"
 >;
 
-function mask(value: unknown, secrets: string[]): unknown {
+/** Redacts every string inside `value`; pass `secrets` longest first so overlaps mask fully. */
+export function mask(value: unknown, secrets: string[]): unknown {
   if (typeof value === "string") {
     let text = value;
     for (const secret of secrets) text = text.split(secret).join("[REDACTED]");

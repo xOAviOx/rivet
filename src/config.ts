@@ -119,7 +119,7 @@ export const destination = (c: Config) =>
     : c.provider === "anthropic"
       ? "https://api.anthropic.com/v1/messages"
       : `${c.endpoint!.replace(/\/$/, "")}/chat/completions`;
-export const keyName = (c: Config) =>
+export const keyName = (c: Pick<Config, "provider" | "keyEnv">) =>
   c.keyEnv ||
   (c.provider === "openai"
     ? "OPENAI_API_KEY"

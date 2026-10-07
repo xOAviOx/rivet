@@ -501,6 +501,48 @@ test("confirm answers yes only for y; Enter, Escape and abort answer no", async 
   assert.equal(await piped.terminal.confirm("Record?"), true);
 });
 
+test("ask echoes a visible answer, drops controls, and cancels on Escape, Ctrl+C, or abort", async (t) => {
+  const { terminal, input, screen } = open(t);
+  const answer = terminal.ask("Model\nid:");
+  await settle();
+  assert.equal(screen(), "Model id:");
+  await type(input, "gpt-xy\x7f");
+  await type(input, `${ESC}[200~.1\u202e\r\n${ESC}[201~`);
+  assert.equal(screen(), "Model id: gpt-x.1");
+  await type(input, "\r");
+  assert.equal(await answer, "gpt-x.1");
+  const escaped = terminal.ask("Again:");
+  await settle();
+  await type(input, `abc${ESC}`);
+  await delay(600);
+  assert.equal(await escaped, null);
+  const interrupted = terminal.ask("Again:");
+  await settle();
+  await type(input, "\x03");
+  assert.equal(await interrupted, null);
+  const controller = new AbortController();
+  const aborted = terminal.ask("Again:", controller.signal);
+  await settle();
+  controller.abort();
+  assert.equal(await aborted, null);
+  assert.equal(
+    screen(),
+    ["  Model id: gpt-x.1", ...Array(3).fill("  Again: (cancelled)"), ">"].join(
+      "\n",
+    ),
+  );
+
+  const piped = open(t, {}, fakeTty({ tty: false }));
+  piped.input.write("openai\n");
+  assert.equal(await piped.terminal.ask("Provider:"), "openai");
+  piped.input.end();
+  assert.equal(await piped.terminal.ask("Model id:"), null);
+  assert.equal(
+    piped.raw(),
+    "Provider: \n  Provider: openai\nModel id: \n  Model id: (cancelled)\n",
+  );
+});
+
 test("concealed input is resolved intact but echoed and recalled masked", async (t) => {
   const conceal = (text) => (text.startsWith("/key ") ? "/key [hidden]" : text);
   const { terminal, input, screen } = open(t, { conceal });

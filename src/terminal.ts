@@ -51,6 +51,8 @@ export interface Terminal {
     args: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<Decision>;
+  /** Reads one visible line; null when cancelled (Esc, Ctrl+C, abort) or input ends. */
+  ask(question: string, signal?: AbortSignal): Promise<string | null>;
   /** Reads a value without echo; null when cancelled or empty. */
   secret(label: string): Promise<string | null>;
   /** Yes/no question. Only "y" answers yes; Enter, Esc, and Ctrl+C answer no. */
@@ -74,6 +76,7 @@ type Modal = {
 
 const MAX_INPUT = 512 * 1024;
 const MAX_SECRET = 16 * 1024;
+const MAX_ANSWER = 4096;
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const zeroWidth = /^[\p{Mn}\p{Me}\p{Cf}\p{Cc}]+$/u;
 const wideRanges: Array<[number, number]> = [
@@ -175,9 +178,10 @@ function truncateStart(text: string, max: number): string {
 }
 const hex = (c: string) => c.charCodeAt(0).toString(16).padStart(4, "0");
 /** Exact JSON with every terminal-affecting character escaped. */
-const jsonVisible = (value: unknown) =>
+export const jsonVisible = (value: unknown) =>
   (JSON.stringify(value) ?? "undefined").replace(unsafe, (c) => `\\u${hex(c)}`);
-const textVisible = (text: string) =>
+/** Text with controls and bidi characters shown as `<U+XXXX>`; tabs and newlines kept. */
+export const textVisible = (text: string) =>
   text.replace(unsafe, (c) => `<U+${hex(c).toUpperCase()}>`);
 const oneLine = (text: string) => clean(text.replace(/\s+/g, " ")).trim();
 const display = (text: string) => text.replace(/\t/g, "    ");
@@ -956,6 +960,64 @@ export function createTerminal(options: TerminalOptions = {}): Terminal {
               cancel: () => finish("deny", "cancelled"),
             };
             paint(finalize() + block);
+          }),
+      );
+    },
+    ask(question, signal) {
+      return exclusive(
+        () =>
+          new Promise<string | null>((resolve) => {
+            if (closed || signal?.aborted) return resolve(null);
+            const label = oneLine(question);
+            let done = false;
+            const finish = (answer: string | null) => {
+              if (done) return;
+              done = true;
+              signal?.removeEventListener("abort", onAbort);
+              modal = undefined;
+              commitLines(
+                `  ${label} ${answer === null ? "(cancelled)" : textVisible(answer)}`,
+              );
+              resolve(answer);
+            };
+            const onAbort = () => finish(null);
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (!interactive) {
+              paint(finalize() + `${label} `);
+              void nextLine(signal).then((line) => {
+                if (done) return;
+                paint("\n");
+                finish(line);
+              });
+              return;
+            }
+            let value = "";
+            const prompt: Modal = {
+              line: `${label} `,
+              key(ch, key) {
+                if ((key.ctrl && key.name === "c") || key.name === "escape")
+                  return finish(null);
+                if (key.name === "return" || key.name === "enter")
+                  return finish(value);
+                if (key.name === "backspace")
+                  value = Array.from(value).slice(0, -1).join("");
+                else if (ch && !key.ctrl && !key.meta) append(ch);
+                else return;
+                prompt.line = `${label} ${value}`;
+                draw();
+              },
+              paste(text) {
+                append(text);
+                prompt.line = `${label} ${value}`;
+              },
+              cancel: () => finish(null),
+            };
+            const append = (text: string) => {
+              const piece = text.replace(controlChars, "").replace(unsafe, "");
+              if (value.length + piece.length <= MAX_ANSWER) value += piece;
+            };
+            modal = prompt;
+            paint(finalize());
           }),
       );
     },
