@@ -1,25 +1,27 @@
+#!/usr/bin/env node
 import { createInterface } from "node:readline";
 import { readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   configDir,
-  configSchema,
   destination,
   keyName,
   loadConfig,
   privateDir,
-  saveConfig,
   type Config,
 } from "./config.js";
 import { credential } from "./credentials.js";
 import { createProvider, probe } from "./providers.js";
 import { clean, Policy, Workspace, type Decision } from "./security.js";
 import type { Session, Store } from "./store.js";
-import { buildSystem, runAgent } from "./agent.js";
+import { buildSystem, reconcileSession, runAgent } from "./agent.js";
 import { changeModel, listModels, modelLines, resolveModel } from "./models.js";
 import { exportSession } from "./export.js";
 import { workspaceDiff } from "./diff.js";
 import { createTerminal, type Terminal } from "./terminal.js";
+import { connectAll, type McpSet } from "./mcp.js";
+import { settingsReport, toolDetails } from "./inspect.js";
+import { runSetup } from "./setup.js";
 import { RivetError, errorText, type AgentEvent, type Emit } from "./types.js";
 
 const database = () => join(configDir(), "sessions.sqlite");
@@ -113,16 +115,45 @@ interface Ctx {
   workspace: Workspace;
   json: boolean;
   sessionKey?: string;
-  /** Interactive sessions only; one-shot commands write to stdout directly. */
+  /** Shared terminal renderer and approvals for interactive sessions and runs. */
   terminal?: Terminal;
   /** Kept for the whole session so "session" approvals outlive one turn. */
   policy?: Policy;
   emit?: Emit;
+  mcp?: McpSet;
 }
 
-/** Interactive output goes through the terminal so it never tears the live editor. */
+function approvalDestination(
+  ctx: Ctx,
+  name: string,
+  args: Record<string, unknown>,
+) {
+  const owner = ctx.mcp?.owner(name);
+  if (owner) {
+    const server = ctx.config.mcp.find((entry) => entry.name === owner.name)!;
+    return server.transport === "http"
+      ? `MCP ${server.name} at ${server.url}`
+      : `MCP ${server.name}: ${JSON.stringify([server.command, ...server.args])} in ${ctx.workspace.root} (not sandboxed)`;
+  }
+  const target =
+    typeof args.path === "string"
+      ? args.path
+      : typeof args.cwd === "string"
+        ? args.cwd
+        : ".";
+  const where = resolve(ctx.workspace.root, target);
+  return name === "command" || name === "git"
+    ? `host process in ${where} (not sandboxed)`
+    : where;
+}
+
+/**
+ * Interactive output goes through the terminal so it never tears the live editor.
+ * JSON sessions keep stdout for event lines, so command output and notices use stderr.
+ */
 const say = (ctx: Ctx, text: string) => {
-  if (ctx.terminal) ctx.terminal.print(text);
+  if (ctx.json) process.stderr.write(`${clean(text)}\n`);
+  else if (ctx.terminal) ctx.terminal.print(text);
   else process.stdout.write(`${text}\n`);
 };
 
@@ -166,21 +197,42 @@ async function runTurn(
     ctx.emit?.(e),
   ));
   policy.config = ctx.config;
-  return await runAgent(
-    {
-      config: ctx.config,
-      provider: createProvider(ctx.config, key),
-      secrets: [key],
-      store: ctx.store,
-      session: ctx.session,
-      workspace: ctx.workspace,
-      policy,
-      signal,
-      emit,
+  const mcp = await connectAll(
+    ctx.config.mcp,
+    signal,
+    (event) => {
+      emit(event);
+      ctx.store.event(ctx.session.id, event);
     },
-    input,
-    ctx.store.messages(ctx.session.id),
+    {
+      cwd: ctx.workspace.root,
+      secrets: [key],
+      timeoutMs: ctx.config.limits.timeoutMs,
+      outputBytes: ctx.config.limits.outputBytes,
+    },
   );
+  ctx.mcp = mcp;
+  try {
+    return await runAgent(
+      {
+        config: ctx.config,
+        provider: createProvider(ctx.config, key),
+        secrets: [key],
+        store: ctx.store,
+        session: ctx.session,
+        workspace: ctx.workspace,
+        policy,
+        mcp,
+        signal,
+        emit,
+      },
+      input,
+      ctx.store.messages(ctx.session.id),
+    );
+  } finally {
+    await mcp.close();
+    ctx.mcp = undefined;
+  }
 }
 
 const HELP = `rivet - a local, permission-controlled terminal coding agent
@@ -197,7 +249,8 @@ Usage:
   rivet export <id> [file]  export a session's events as JSONL
   rivet help                show this help
 
-Session commands: /help /key /model /diff /sessions /export /exit
+Session commands: /help /key /model /diff /details /settings /sessions
+/export /exit
 
 Session keys: Enter sends, Alt+Enter or Ctrl+J adds a line, Ctrl+C
 interrupts work (or clears the draft; again on an empty draft exits).
@@ -211,32 +264,24 @@ function exitFor(result: { reason: string; exitCode: number }) {
 
 /** Uncertain actions are shown and never replayed; recording them restores call/result pairs. */
 async function reconcile(ctx: Ctx, terminal: Terminal) {
-  for (const action of ctx.store.pending(ctx.session.id)) {
-    if (!process.stdin.isTTY || ctx.json) {
+  const interactive = process.stdin.isTTY && !ctx.json;
+  await reconcileSession(ctx.store, ctx.session.id, async (call) => {
+    if (!interactive) {
       say(
         ctx,
-        `· pending action ${action.call.id} (${action.call.name}) requires reconciliation; run rivet resume ${ctx.session.id} in a terminal`,
+        `· pending action ${call.id} (${call.name}) requires reconciliation; run rivet resume ${ctx.session.id} in a terminal`,
       );
-      continue;
+      return false;
     }
     terminal.print(
-      `Interrupted action: ${action.call.name} ${JSON.stringify(action.call.arguments)}`,
+      `Interrupted action: ${call.name} ${JSON.stringify(call.arguments)}`,
     );
-    if (!(await terminal.confirm("Record as aborted?"))) continue;
-    const recorded =
-      "Interrupted before completion; recorded as aborted during reconciliation and not replayed.";
-    ctx.store.finish(action.id, JSON.stringify({ error: recorded }));
-    ctx.store.append(ctx.session.id, {
-      role: "tool",
-      content: recorded,
-      callId: action.call.id,
-      error: true,
-    });
-  }
+    return await terminal.confirm("Record as aborted?");
+  });
 }
 
 const COMMANDS =
-  "/help /key [secret] /model [id] /diff [--staged] [path] /sessions /export [file] /exit";
+  "/help /key [secret] /model [id] /diff [--staged] [path] /details [count] /settings /sessions /export [file] /exit";
 
 async function command(
   ctx: Ctx,
@@ -301,6 +346,33 @@ async function command(
       say(ctx, result.text || "· no changes");
       return undefined;
     }
+    case "details": {
+      const count =
+        rest[0] === undefined ? 1 : /^\d+$/.test(rest[0]) ? Number(rest[0]) : 0;
+      if (!Number.isSafeInteger(count) || count < 1 || rest.length > 1)
+        throw new RivetError("Usage: /details [count]", 2);
+      say(
+        ctx,
+        toolDetails(
+          ctx.store.messages(ctx.session.id),
+          count,
+          ctx.sessionKey ? [ctx.sessionKey] : [],
+        ),
+      );
+      return undefined;
+    }
+    case "settings":
+      say(
+        ctx,
+        settingsReport(ctx.config, {
+          configFile: join(configDir(), "config.json"),
+          database: database(),
+          session: ctx.session.id,
+          workspace: ctx.workspace.root,
+          sessionKey: !!ctx.sessionKey,
+        }),
+      );
+      return undefined;
     case "sessions":
       for (const s of ctx.store.list().slice(0, 20))
         say(ctx, `${s.id} ${s.createdAt} ${s.model}`);
@@ -350,6 +422,7 @@ async function repl(ctx: Ctx) {
   // JSON sessions stay in line mode so stdout carries only event lines.
   const terminal = createTerminal({
     workspace: ctx.workspace.root,
+    destination: (name, args) => approvalDestination(ctx, name, args),
     onInterrupt: interrupt,
     conceal: (text) => (/^\s*\/key\s+\S/.test(text) ? "/key [hidden]" : text),
     ...(ctx.json ? { interactive: false, color: false } : {}),
@@ -421,60 +494,25 @@ async function withStore<T>(work: (store: Store) => Promise<T>): Promise<T> {
   }
 }
 
+/** Answers come from the terminal editor, or one per line when stdin is not a terminal. */
 async function cmdSetup() {
-  if (!process.stdin.isTTY)
-    throw new RivetError("rivet setup requires an interactive terminal", 2);
-  console.log(
-    "Rivet setup — provider account keys stay in your environment or OS credential store.",
-  );
-  const pick = async (prompt: string, valid: string[]): Promise<string> => {
-    for (;;) {
-      const answer = await ask(prompt);
-      const value = (answer ?? "").trim().toLowerCase();
-      if (valid.includes(value)) return value;
-      console.log(`Choose one of: ${valid.join(", ")}`);
-    }
-  };
-  const provider = await pick("Provider [openai/anthropic/compatible]: ", [
-    "openai",
-    "anthropic",
-    "compatible",
-  ]);
-  const endpoint =
-    provider === "compatible"
-      ? ((await ask("Endpoint URL: ")) ?? "").trim()
-      : undefined;
-  const source = await pick("Credential source [environment/os]: ", [
-    "environment",
-    "os",
-  ]);
-  const modelId = ((await ask("Model id: ")) ?? "").trim();
-  const context = Number(
-    ((await ask("Context window (tokens): ")) ?? "").trim(),
-  );
-  const maxOutput = Number(
-    ((await ask("Max output tokens [4096]: ")) ?? "4096").trim() || "4096",
-  );
-  const parsed = configSchema.parse({
-    provider,
-    ...(endpoint ? { endpoint } : {}),
-    credential: source,
-    model: { id: modelId, tools: true, context, maxOutput },
-  });
-  const key = await credential(parsed).catch(() => undefined);
-  if (key) {
-    console.log("Checking tool calling with the configured model...");
-    await probe(createProvider(parsed, key), new AbortController().signal);
-    console.log("Model passed the capability check.");
-  } else {
-    console.log(
-      `No ${keyName(parsed)} available now; run rivet models check after setting it.`,
+  const controller = new AbortController();
+  const interrupt = () => controller.abort();
+  const terminal = createTerminal({ onInterrupt: interrupt });
+  process.on("SIGINT", interrupt);
+  try {
+    await runSetup(
+      {
+        ask: (question) => terminal.ask(question, controller.signal),
+        secret: (label) => terminal.secret(label),
+        print: (text) => terminal.print(text),
+      },
+      { signal: controller.signal },
     );
+  } finally {
+    process.removeListener("SIGINT", interrupt);
+    terminal.close();
   }
-  await saveConfig(parsed);
-  console.log(
-    `Saved ${join(configDir(), "config.json")}. Run rivet inside a project directory.`,
-  );
 }
 
 async function main() {
@@ -538,14 +576,39 @@ async function main() {
         destination: destination(config),
       });
       const render = renderer(json);
-      const result = await runTurn(
-        { config, store, session, workspace, json },
-        prompt,
-        new AbortController().signal,
-        (event) => render.render(event),
-      );
-      render.flush();
-      exitFor(result);
+      const controller = new AbortController();
+      const interrupt = () => controller.abort();
+      const ctx: Ctx = { config, store, session, workspace, json };
+      const terminal =
+        process.stdin.isTTY && !json
+          ? createTerminal({
+              workspace: workspace.root,
+              destination: (name, args) => approvalDestination(ctx, name, args),
+              onInterrupt: interrupt,
+            })
+          : undefined;
+      ctx.terminal = terminal;
+      process.on("SIGINT", interrupt);
+      try {
+        const result = await runTurn(
+          ctx,
+          prompt,
+          controller.signal,
+          terminal?.render ?? render.render,
+        );
+        exitFor(result);
+      } catch (error) {
+        if (!controller.signal.aborted) throw error;
+        (terminal?.render ?? render.render)({
+          type: "done",
+          reason: "cancelled",
+        });
+        process.exitCode = 130;
+      } finally {
+        process.removeListener("SIGINT", interrupt);
+        terminal?.close();
+        render.flush();
+      }
     });
   }
   if (cmd === "sessions") {
