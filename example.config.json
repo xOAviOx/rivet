@@ -1,0 +1,39 @@
+{
+  "provider": "openai",
+  "model": {
+    "id": "gpt-4.1",
+    "tools": true,
+    "context": 1000000,
+    "maxOutput": 8192,
+    "inputPrice": 2,
+    "outputPrice": 8
+  },
+  "keyEnv": "OPENAI_API_KEY",
+  "credential": "environment",
+  "mode": "edit",
+  "policy": {},
+  "limits": {
+    "steps": 30,
+    "tools": 100,
+    "tokens": 200000,
+    "cost": 2,
+    "timeoutMs": 120000,
+    "outputBytes": 32768
+  },
+  "mcp": [
+    {
+      "name": "docs",
+      "transport": "stdio",
+      "command": "node",
+      "args": ["./tools/docs-mcp-server.mjs"],
+      "trusted": false
+    },
+    {
+      "name": "tracker",
+      "transport": "http",
+      "url": "https://mcp.example.com/mcp",
+      "keyEnv": "TRACKER_MCP_TOKEN",
+      "trusted": false
+    }
+  ]
+}
