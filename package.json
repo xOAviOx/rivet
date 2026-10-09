@@ -1,0 +1,40 @@
+{
+  "name": "rivet-agent",
+  "version": "0.1.0",
+  "description": "A local, permission-controlled terminal coding agent",
+  "type": "module",
+  "bin": {
+    "rivet": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@11.6.0",
+  "files": [
+    "dist",
+    "README.md",
+    "SECURITY.md",
+    "example.config.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm build && node --test test/*.test.mjs",
+    "lint": "eslint src",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "start": "node dist/cli.js",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3",
+    "prettier": "3.9.8",
+    "eslint": "9.39.5",
+    "@eslint/js": "9.39.5",
+    "typescript-eslint": "8.71.0"
+  }
+}
