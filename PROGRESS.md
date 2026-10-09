@@ -10,13 +10,13 @@ Shared contract: everything new builds on `src/types.ts` (`AgentEvent`, `Emit`, 
 
 Only edit files in your own column. Additive changes to shared files (new exports only) are allowed; note them here.
 
-| Agent A (core, sequential)                                             | Agent B (independent modules)                                               |
-| ---------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `src/agent.ts`: single-step loop, limits, loop detection, cancellation | `src/mcp.ts`: stdio + Streamable HTTP client, trust, bounded discovery      |
-| `src/cli.ts`: run/help/JSON events/exit codes, setup, `/key`, models   | `src/terminal.ts`: header, batched streaming, approval prompt, multiline    |
-| sessions/resume/export commands, uncertain-action reconciliation       | `test/mcp.test.mjs`, `test/terminal.test.mjs`                               |
+| Agent A (core, sequential)                                             | Agent B (independent modules)                                                |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `src/agent.ts`: single-step loop, limits, loop detection, cancellation | `src/mcp.ts`: stdio + Streamable HTTP client, trust, bounded discovery       |
+| `src/cli.ts`: run/help/JSON events/exit codes, setup, `/key`, models   | `src/terminal.ts`: header, batched streaming, approval prompt, multiline     |
+| sessions/resume/export commands, uncertain-action reconciliation       | `test/mcp.test.mjs`, `test/terminal.test.mjs`                                |
 | choose and delete duplicate provider/store modules; port `tools.ts`    | failure-path tests: security, context, config, process, providers (fake SSE) |
-| sample workflow + Git integration test                                 | README, SECURITY.md, ARCHITECTURE.md, example.config.json                   |
+| sample workflow + Git integration test                                 | README, SECURITY.md, ARCHITECTURE.md, example.config.json                    |
 
 Integration points Agent A can rely on from Agent B:
 
@@ -55,7 +55,23 @@ Integration points Agent A can rely on from Agent B:
 ## Parallel terminal module
 
 - Takes `src/terminal.ts` and `test/terminal.test.mjs` from Agent B's column (Agent B is on MCP). Agent B: skip the terminal item. No edits to CLI, agent loop, tools, MCP, export, diff, or shared modules.
-- Contract (as listed above, plus two additions): `createTerminal(options)` returns `{ header(info), render(event: AgentEvent), prompt(): Promise<string | null>, approve(name, args, signal): Promise<Decision>, secret(label): Promise<string | null>, close() }`. `secret` reads a key without echo for `/key`. `prompt()` resolves `null` on idle Ctrl+C / Ctrl+D (exit). Options accept `input`/`output` streams, `color`, `columns` for tests.
+- **Complete.** Module committed in `01a5ad6`; CLI wiring committed after it (see below).
+- Final contract: `createTerminal(options)` returns `{ interactive, header(info), render(event), print(text), prompt(), approve(name, args, signal), secret(label), confirm(question, signal?), close() }`. Options: `input`, `output`, `interactive`, `color`, `columns`, `workspace`, `destination(name, args)`, `onInterrupt`, `conceal(text)`, `flushMs`. Also exports `width`, `truncate`, `summarize`.
+  - `prompt()` resolves `null` on idle Ctrl+C (empty draft) / Ctrl+D / end of input. Messages typed during work queue (max 10) and are sent by the next `prompt()`; Ctrl+C during work returns them to the draft unsent.
+  - `approve()` shows exact, untruncated arguments (controls and bidi shown as `<U+…>`) and the destination (`host process in … (not sandboxed)` for `command`/`git`). Keys o / s / d; Enter has no default; Esc, Ctrl+C, and abort deny ("cancelled").
+  - `secret()` reads without echo; `confirm()` answers yes only for `y`. `conceal` rewrites a submitted message for echo and history (the CLI masks `/key <secret>`).
+  - Non-TTY input uses line mode: no escape sequences, prompts and approvals read whole lines.
+- **CLI wiring (`src/cli.ts`, interactive session only; claimed here at 05:05 while `cli.ts` was idle):** `repl` uses `createTerminal` for the header, prompt, rendering, approvals, and command output. Ctrl+C aborts the active turn or slash command through `onInterrupt`. Other changes:
+  - A failed slash command or turn prints `error: …` and keeps the session. Before this, an unknown command ended the process.
+  - `/key` with no argument reads the key hidden. `/key <secret>` is echoed as `/key [hidden]`.
+  - The `Policy` lives for the whole session, so "session rule" approvals now outlive one turn (it was rebuilt every turn).
+  - `/diff` keeps spaces in paths, uses the active cancellation signal, and drops the duplicate truncation notice (per `DIFF_HANDOFF.md`). `/help` and `rivet help` now list `/diff`.
+  - `reconcile` uses `terminal.confirm`. `--json` sessions use line mode and print no header, so stdout carries only JSONL.
+  - Unchanged: `run`, `setup`, and the other subcommands still use the readline `ask`/`renderer` path.
+- Evidence: 22 terminal tests (fake TTY plus a small VT emulator). Real ConPTY runs (tuistory, Windows 11) against a local fake OpenAI-compatible SSE server covered: multiline Alt+Enter, streaming, file_patch approval (Enter ignored, `o` approved, file written), type-ahead plus Ctrl+C interrupt (queued text restored to the draft), `/key` hidden and inline (no `sk-` text in scrollback), unknown command keeps the session, `resume` reconciliation (Enter = no, `y` records an abort and the next turn works), and idle Ctrl+C exit. Piped and `--json` sessions checked without a PTY. Full suite: typecheck 0, lint 0, 161 tests, 155 pass, 0 fail, 6 todo.
+- Findings for owners:
+  - `diff.ts`: `/diff` outside a Git repository throws `Cannot read Git diff:` followed by Git's entire `--no-index` usage text (about 150 lines). Suggest checking `git rev-parse --is-inside-work-tree` first and throwing a short "not a Git repository" error.
+  - `cli.ts` `run` mode: Ctrl+C kills the process instead of cancelling (its `AbortController` is never aborted), and approvals there still use the readline prompt without a destination line. Wiring `createTerminal` into `run` (TTY, non-JSON) would fix both.
 
 ## Parallel model selection module
 

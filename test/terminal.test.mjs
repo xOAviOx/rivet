@@ -210,6 +210,31 @@ test("messages typed during work are queued for the next prompt", async (t) => {
   assert.equal(await terminal.prompt(), "two");
 });
 
+test("interrupting returns queued messages to the draft instead of sending them", async (t) => {
+  let interrupts = 0;
+  const { terminal, input, screen } = open(t, {
+    onInterrupt: () => interrupts++,
+  });
+  const first = terminal.prompt();
+  await type(input, "one\r");
+  await first;
+  await type(input, "two\rthree\rpartial");
+  assert.match(screen(), /2 queued\n> partial$/);
+  await type(input, "\x03");
+  assert.equal(interrupts, 1);
+  terminal.render({ type: "done", reason: "cancelled" });
+  let sent = false;
+  const next = terminal.prompt().then((value) => {
+    sent = true;
+    return value;
+  });
+  await settle();
+  assert.equal(sent, false, "queued messages are not sent automatically");
+  assert.match(screen(), /interrupted\n> two\n\n {2}three\n\n {2}partial$/);
+  await type(input, "\r");
+  assert.equal(await next, "two\n\nthree\n\npartial");
+});
+
 test("approval shows exact arguments and destination, never truncated, with no default", async (t) => {
   const { terminal, input, all, raw, screen } = open(t, { columns: 20 });
   const long = "x".repeat(300);
@@ -440,6 +465,67 @@ test("secret input never echoes and cancels on Escape", async (t) => {
   await type(input, ESC);
   await delay(600);
   assert.equal(await cancelled, null);
+});
+
+test("confirm answers yes only for y; Enter, Escape and abort answer no", async (t) => {
+  const { terminal, input, screen } = open(t);
+  const yes = terminal.confirm("Record as\naborted?");
+  await settle();
+  assert.match(screen(), /^Record as aborted\? \[y\/N\]$/);
+  await type(input, "xY");
+  assert.equal(await yes, true);
+  const enter = terminal.confirm("Again?");
+  await settle();
+  await type(input, "\r");
+  assert.equal(await enter, false);
+  const escaped = terminal.confirm("Again?");
+  await settle();
+  await type(input, ESC);
+  await delay(600);
+  assert.equal(await escaped, false);
+  const controller = new AbortController();
+  const aborted = terminal.confirm("Again?", controller.signal);
+  await settle();
+  controller.abort();
+  assert.equal(await aborted, false);
+  assert.equal(
+    screen(),
+    [
+      "  Record as aborted? [y/N] yes",
+      ...Array(3).fill("  Again? [y/N] no"),
+      ">",
+    ].join("\n"),
+  );
+  const piped = open(t, {}, fakeTty({ tty: false }));
+  piped.input.write("yes\n");
+  assert.equal(await piped.terminal.confirm("Record?"), true);
+});
+
+test("concealed input is resolved intact but echoed and recalled masked", async (t) => {
+  const conceal = (text) => (text.startsWith("/key ") ? "/key [hidden]" : text);
+  const { terminal, input, screen } = open(t, { conceal });
+  const reply = terminal.prompt();
+  await type(input, "/key sk-live-123\r");
+  assert.equal(await reply, "/key sk-live-123");
+  terminal.render({ type: "done", reason: "complete" });
+  const next = terminal.prompt();
+  await type(input, `${ESC}[A`);
+  assert.equal(screen(), "> /key [hidden]\n> /key [hidden]");
+  await type(input, "\x03\x03");
+  assert.equal(await next, null);
+  assert.ok(!screen().includes("sk-live"));
+});
+
+test("a new prompt clears tools left running by a turn that ended without done", async (t) => {
+  const { terminal, screen } = open(t);
+  terminal.render({
+    type: "tool.start",
+    call: { id: "1", name: "file_read", arguments: { path: "a" } },
+  });
+  assert.match(screen(), /running file_read a/);
+  void terminal.prompt();
+  await settle();
+  assert.equal(screen(), ">");
 });
 
 test("line mode reads prompts and approvals from piped input without control sequences", async (t) => {

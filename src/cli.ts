@@ -19,13 +19,10 @@ import { buildSystem, runAgent } from "./agent.js";
 import { changeModel, listModels, modelLines, resolveModel } from "./models.js";
 import { exportSession } from "./export.js";
 import { workspaceDiff } from "./diff.js";
+import { createTerminal, type Terminal } from "./terminal.js";
 import { RivetError, errorText, type AgentEvent, type Emit } from "./types.js";
 
 const database = () => join(configDir(), "sessions.sqlite");
-const cyan = (text: string) =>
-  process.stdout.isTTY && !process.env.NO_COLOR
-    ? `\x1b[36m${text}\x1b[0m`
-    : text;
 
 function ask(question: string): Promise<string | null> {
   return new Promise((resolve) => {
@@ -116,7 +113,18 @@ interface Ctx {
   workspace: Workspace;
   json: boolean;
   sessionKey?: string;
+  /** Interactive sessions only; one-shot commands write to stdout directly. */
+  terminal?: Terminal;
+  /** Kept for the whole session so "session" approvals outlive one turn. */
+  policy?: Policy;
+  emit?: Emit;
 }
+
+/** Interactive output goes through the terminal so it never tears the live editor. */
+const say = (ctx: Ctx, text: string) => {
+  if (ctx.terminal) ctx.terminal.print(text);
+  else process.stdout.write(`${text}\n`);
+};
 
 const approve =
   (ctx: Ctx) =>
@@ -127,11 +135,10 @@ const approve =
   ): Promise<Decision> => {
     if (ctx.json || !process.stdin.isTTY) {
       if (!ctx.json)
-        process.stdout.write(
-          `· approval ${name}: denied (no interactive terminal)\n`,
-        );
+        say(ctx, `· approval ${name}: denied (no interactive terminal)`);
       return "deny";
     }
+    if (ctx.terminal) return await ctx.terminal.approve(name, args, signal);
     // Exact, untruncated arguments; the decision belongs to the user alone.
     process.stdout.write(
       `\n${name} ${JSON.stringify(args, null, 2)}\nApprove? [o]nce / [s]ession / [d]eny: `,
@@ -154,7 +161,11 @@ async function runTurn(
   const key = await credential(ctx.config, ctx.sessionKey).catch((e) => {
     throw e instanceof RivetError ? e : new RivetError(errorText(e), 2);
   });
-  const policy = new Policy(ctx.config, approve(ctx), emit);
+  ctx.emit = emit;
+  const policy = (ctx.policy ??= new Policy(ctx.config, approve(ctx), (e) =>
+    ctx.emit?.(e),
+  ));
+  policy.config = ctx.config;
   return await runAgent(
     {
       config: ctx.config,
@@ -185,36 +196,32 @@ Usage:
   rivet export <id> [file]  export a session's events as JSONL
   rivet help                show this help
 
-Session commands: /help /key /model /sessions /export /exit
+Session commands: /help /key /model /diff /sessions /export /exit
+
+Session keys: Enter sends, Alt+Enter or Ctrl+J adds a line, Ctrl+C
+interrupts work (or clears the draft; again on an empty draft exits).
 
 Exit codes: 0 success, 1 error, 2 configuration or credential,
 3 policy or approval denial, 4 limit reached, 130 cancelled.`;
-
-function header(config: Config, root: string) {
-  const name = resolve(root).split(/[\\/]/).pop();
-  process.stdout.write(
-    `${name} · ${config.provider}:${config.model.id} · ${config.mode}\n`,
-  );
-}
 
 function exitFor(result: { reason: string; exitCode: number }) {
   process.exitCode = result.reason === "complete" ? 0 : result.exitCode;
 }
 
 /** Uncertain actions are shown and never replayed; recording them restores call/result pairs. */
-async function reconcile(ctx: Ctx) {
+async function reconcile(ctx: Ctx, terminal: Terminal) {
   for (const action of ctx.store.pending(ctx.session.id)) {
     if (!process.stdin.isTTY || ctx.json) {
-      process.stdout.write(
-        `· pending action ${action.call.id} (${action.call.name}) requires reconciliation; run rivet resume ${ctx.session.id} in a terminal\n`,
+      say(
+        ctx,
+        `· pending action ${action.call.id} (${action.call.name}) requires reconciliation; run rivet resume ${ctx.session.id} in a terminal`,
       );
       continue;
     }
-    process.stdout.write(
-      `Interrupted action: ${action.call.name} ${JSON.stringify(action.call.arguments)}\nRecord as aborted? [y/N]: `,
+    terminal.print(
+      `Interrupted action: ${action.call.name} ${JSON.stringify(action.call.arguments)}`,
     );
-    const answer = await ask("");
-    if ((answer ?? "").trim().toLowerCase() !== "y") continue;
+    if (!(await terminal.confirm("Record as aborted?"))) continue;
     const recorded =
       "Interrupted before completion; recorded as aborted during reconciliation and not replayed.";
     ctx.store.finish(action.id, JSON.stringify({ error: recorded }));
@@ -228,26 +235,39 @@ async function reconcile(ctx: Ctx) {
 }
 
 const COMMANDS =
-  "/help /key <secret> /model <json> /sessions /export [file] /exit";
+  "/help /key [secret] /model [id] /diff [--staged] [path] /sessions /export [file] /exit";
 
-async function command(ctx: Ctx, input: string): Promise<"exit" | undefined> {
+async function command(
+  ctx: Ctx,
+  input: string,
+  signal: AbortSignal,
+): Promise<"exit" | undefined> {
   const [name, ...rest] = input.slice(1).split(/\s+/);
   switch (name) {
     case "help":
-      process.stdout.write(`${COMMANDS}\n`);
+      say(ctx, COMMANDS);
       return undefined;
-    case "key":
-      if (!rest[0]) throw new RivetError("Usage: /key <secret>", 2);
-      ctx.sessionKey = rest[0];
-      process.stdout.write("· session key set (not saved)\n");
+    case "key": {
+      // Without an argument the key is read hidden, so it never reaches scrollback.
+      const value =
+        rest[0] ||
+        (ctx.terminal?.interactive
+          ? await ctx.terminal.secret(`${keyName(ctx.config)} for this session`)
+          : null);
+      if (!value) {
+        if (ctx.terminal?.interactive) return undefined;
+        throw new RivetError("Usage: /key <secret>", 2);
+      }
+      ctx.sessionKey = value;
+      say(ctx, "· session key set (not saved)");
       return undefined;
+    }
     case "model": {
       if (!rest.length) {
-        process.stdout.write(`· ${ctx.config.model.id}\n`);
+        say(ctx, `· ${ctx.config.model.id}`);
         return undefined;
       }
       const key = await credential(ctx.config, ctx.sessionKey);
-      const signal = new AbortController().signal;
       // Listing first: resolveModel refuses ids the endpoint does not offer.
       const listing = await listModels(ctx.config, key, signal);
       const id = rest[0];
@@ -260,35 +280,40 @@ async function command(ctx: Ctx, input: string): Promise<"exit" | undefined> {
         signal,
       });
       ctx.config = result.config;
-      process.stdout.write(
-        `· model ${next.id} passed the capability check${result.omitted ? ` (${result.omitted} earlier turn(s) will stay out of context)` : ""}\n`,
+      say(
+        ctx,
+        `· model ${next.id} passed the capability check${result.omitted ? ` (${result.omitted} earlier turn(s) will stay out of context)` : ""}`,
       );
       return undefined;
     }
     case "diff": {
-      const staged = rest.includes("--staged");
-      const path = rest.find((a) => !a.startsWith("--"));
-      const result = await workspaceDiff(
-        ctx.workspace,
-        new AbortController().signal,
-        {
-          staged,
-          ...(path ? { path } : {}),
-        },
-      );
-      if (result.text) {
-        process.stdout.write(`${result.text}\n`);
-        if (result.truncated) process.stdout.write("· diff truncated\n");
-      } else process.stdout.write("· no changes\n");
+      // Parsed from the raw input so spaces inside the path survive.
+      const flag = /(^|\s)--staged(?=\s|$)/g;
+      const args = input.trim().replace(/^\/\S+\s*/, "");
+      const staged = flag.test(args);
+      const path = args.replace(flag, " ").trim();
+      const result = await workspaceDiff(ctx.workspace, signal, {
+        staged,
+        ...(path ? { path } : {}),
+      });
+      // The text already carries its own truncation notice.
+      say(ctx, result.text || "· no changes");
       return undefined;
     }
     case "sessions":
       for (const s of ctx.store.list().slice(0, 20))
-        process.stdout.write(`${s.id} ${s.createdAt} ${s.model}\n`);
+        say(ctx, `${s.id} ${s.createdAt} ${s.model}`);
       return undefined;
-    case "export":
-      await writeExport(ctx.store, ctx.session.id, rest[0], ctx.sessionKey);
+    case "export": {
+      const target = await writeExport(
+        ctx.store,
+        ctx.session.id,
+        rest[0],
+        ctx.sessionKey,
+      );
+      say(ctx, `· exported session ${ctx.session.id} to ${target}`);
       return undefined;
+    }
     case "exit":
     case "quit":
       return "exit";
@@ -315,39 +340,63 @@ async function writeExport(
     sessionKey ? [sessionKey] : [],
   );
   await writeFile(target, content, { flag: "wx" });
-  process.stdout.write(`· exported session ${id} to ${target}\n`);
+  return target;
 }
 
 async function repl(ctx: Ctx) {
-  header(ctx.config, ctx.workspace.root);
-  await reconcile(ctx);
-  for (;;) {
-    const input = await ask(cyan("rivet> "));
-    if (input === null) return;
-    const trimmed = input.trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("/")) {
-      if ((await command(ctx, trimmed)) === "exit") return;
-      continue;
+  let active: AbortController | undefined;
+  const interrupt = () => active?.abort();
+  // JSON sessions stay in line mode so stdout carries only event lines.
+  const terminal = createTerminal({
+    workspace: ctx.workspace.root,
+    onInterrupt: interrupt,
+    conceal: (text) => (/^\s*\/key\s+\S/.test(text) ? "/key [hidden]" : text),
+    ...(ctx.json ? { interactive: false, color: false } : {}),
+  });
+  ctx.terminal = terminal;
+  try {
+    if (!ctx.json)
+      terminal.header({
+        workspace: ctx.workspace.root,
+        provider: ctx.config.provider,
+        model: ctx.config.model.id,
+        mode: ctx.config.mode,
+      });
+    await reconcile(ctx, terminal);
+    for (;;) {
+      const input = await terminal.prompt();
+      if (input === null) return;
+      const trimmed = input.trim();
+      if (!trimmed) continue;
+      const controller = (active = new AbortController());
+      // Raw mode reports Ctrl+C through onInterrupt; SIGINT covers line mode and kill.
+      process.on("SIGINT", interrupt);
+      try {
+        if (trimmed.startsWith("/")) {
+          if ((await command(ctx, trimmed, controller.signal)) === "exit")
+            return;
+          continue;
+        }
+        const result = await runTurn(
+          ctx,
+          trimmed,
+          controller.signal,
+          ctx.json ? renderer(true).render : terminal.render,
+        );
+        exitFor(result);
+      } catch (e) {
+        // A failed command or turn reports and keeps the session.
+        say(ctx, `error: ${clean(errorText(e))}`);
+        if (!trimmed.startsWith("/"))
+          process.exitCode = e instanceof RivetError ? e.exitCode : 1;
+      } finally {
+        active = undefined;
+        process.removeListener("SIGINT", interrupt);
+      }
     }
-    const controller = new AbortController();
-    // Ctrl+C while working cancels the turn; at the prompt it exits via readline.
-    const interrupt = () => controller.abort();
-    process.on("SIGINT", interrupt);
-    try {
-      const result = await runTurn(
-        ctx,
-        trimmed,
-        controller.signal,
-        renderer(ctx.json).render,
-      );
-      exitFor(result);
-    } catch (e) {
-      process.stdout.write(`error: ${clean(errorText(e))}\n`);
-      process.exitCode = e instanceof RivetError ? e.exitCode : 1;
-    } finally {
-      process.removeListener("SIGINT", interrupt);
-    }
+  } finally {
+    terminal.close();
+    ctx.terminal = undefined;
   }
 }
 
@@ -520,13 +569,14 @@ async function main() {
           2,
         );
       if (cmd === "export") {
-        await writeExport(
+        const target = await writeExport(
           store,
           id,
           rest.find((a, i) => i > 0 && !a.startsWith("--")),
           undefined,
           rest.includes("--markdown"),
         );
+        process.stdout.write(`· exported session ${id} to ${target}\n`);
         return;
       }
       await repl({ config, store, session, workspace, json });

@@ -29,6 +29,8 @@ export type TerminalOptions = {
   destination?: (name: string, args: Record<string, unknown>) => string;
   /** Ctrl+C while work is active, or while an approval is open. */
   onInterrupt?: () => void;
+  /** Rewrites a submitted message before it is echoed or kept in history. */
+  conceal?: (text: string) => string;
   flushMs?: number;
 };
 export type HeaderInfo = {
@@ -51,6 +53,8 @@ export interface Terminal {
   ): Promise<Decision>;
   /** Reads a value without echo; null when cancelled or empty. */
   secret(label: string): Promise<string | null>;
+  /** Yes/no question. Only "y" answers yes; Enter, Esc, and Ctrl+C answer no. */
+  confirm(question: string, signal?: AbortSignal): Promise<boolean>;
   close(): void;
 }
 
@@ -596,10 +600,11 @@ export function createTerminal(options: TerminalOptions = {}): Terminal {
       cursor = atColumn(end + 1, lineEndOf(end + 1), column);
     }
   }
+  const shown = (text: string) => options.conceal?.(text) ?? text;
   function submit() {
     const text = buffer;
     if (!text.trim()) return;
-    if (history.at(-1) !== text) history.push(text);
+    if (history.at(-1) !== shown(text)) history.push(shown(text));
     if (history.length > 100) history.shift();
     historyIndex = history.length;
     draft = "";
@@ -609,7 +614,7 @@ export function createTerminal(options: TerminalOptions = {}): Terminal {
     if (resolve) {
       pendingPrompt = undefined;
       working = true;
-      echo(text);
+      echo(shown(text));
       resolve(text);
     } else if (queued.length < 10) {
       queued.push(text);
@@ -629,6 +634,13 @@ export function createTerminal(options: TerminalOptions = {}): Terminal {
         cursor = 0;
         historyIndex = history.length;
       } else {
+        // Interrupting hands control back: queued messages return to the draft unsent.
+        if (queued.length) {
+          buffer = [...queued.splice(0), ...(buffer ? [buffer] : [])].join(
+            "\n\n",
+          );
+          cursor = buffer.length;
+        }
         interrupting = true;
         interrupt();
       }
@@ -871,6 +883,8 @@ export function createTerminal(options: TerminalOptions = {}): Terminal {
       if (closed) return Promise.resolve(null);
       working = false;
       interrupting = false;
+      // A turn that threw before "done" must not leave tools shown as running.
+      running.clear();
       if (!interactive)
         return (async () => {
           paint(finalize());
@@ -884,7 +898,7 @@ export function createTerminal(options: TerminalOptions = {}): Terminal {
       const next = queued.shift();
       if (next !== undefined) {
         working = true;
-        echo(next);
+        echo(shown(next));
         return Promise.resolve(next);
       }
       return new Promise((resolve) => {
@@ -985,6 +999,53 @@ export function createTerminal(options: TerminalOptions = {}): Terminal {
               },
               paste: append,
               cancel: () => finish(null),
+            };
+            paint(finalize());
+          }),
+      );
+    },
+    confirm(question, signal) {
+      return exclusive(
+        () =>
+          new Promise<boolean>((resolve) => {
+            if (closed || signal?.aborted) return resolve(false);
+            const text = `${oneLine(question)} [y/N]`;
+            let done = false;
+            const finish = (yes: boolean) => {
+              if (done) return;
+              done = true;
+              signal?.removeEventListener("abort", onAbort);
+              modal = undefined;
+              commitLines(`  ${text} ${yes ? "yes" : "no"}`);
+              resolve(yes);
+            };
+            const onAbort = () => finish(false);
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (!interactive) {
+              paint(finalize() + `${text}: `);
+              void nextLine(signal).then((answer) => {
+                if (done) return;
+                paint("\n");
+                finish(/^y(es)?$/i.test((answer ?? "").trim()));
+              });
+              return;
+            }
+            modal = {
+              line: `${text} `,
+              key(ch, key) {
+                if (
+                  (key.ctrl && key.name === "c") ||
+                  key.name === "escape" ||
+                  key.name === "return" ||
+                  key.name === "enter"
+                )
+                  return finish(false);
+                if (key.ctrl || key.meta) return;
+                const c = (ch ?? "").toLowerCase();
+                if (c === "y") finish(true);
+                else if (c === "n") finish(false);
+              },
+              cancel: () => finish(false),
             };
             paint(finalize());
           }),
