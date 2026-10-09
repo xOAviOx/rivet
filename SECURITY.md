@@ -61,7 +61,8 @@ Read-only Git is a fixed allowlist of subcommands with flag checks (for example 
 - Keys are validated for shape (no line breaks) before use and are never printed. Provider error bodies and fetch error messages are discarded because they can echo headers.
 - Exports redact every environment value whose name contains `KEY`, `TOKEN`, `SECRET`, or `PASSWORD`, the process-only `/key` value, and anything shaped like `sk-...` or `Bearer ...`.
 - Tool results are redacted before storage, output events, and subsequent provider requests using the environment/key-pattern redactor and the active provider credential. This does not detect arbitrary secrets in ordinary project files.
-- OS credential helpers receive no model-controlled arguments; the account name is the SHA-256 of the destination URL.
+- OS credential helpers receive no model-controlled arguments; the account name is the SHA-256 of the destination URL. When `rivet setup` stores a key, it is read with hidden input, passed to the helper on stdin (never on the command line), and stored only after the model passes the tool-calling check.
+- `/settings` and `/details` never print a key: `/settings` shows only the credential source and whether a key is present, and `/details` masks the process-only `/key` value and environment secrets again at display time.
 
 ## Network
 
@@ -87,7 +88,7 @@ All text from the model, tools, files, Git, and MCP is passed through a sanitize
 - `~/.rivet/sessions.sqlite` is created with mode `0600`; the state directory with `0700`. Both are refused if they are symlinks or hard links.
 - A separate writer-lock database is held in an exclusive transaction for the life of the process. A second Rivet process fails with a clear message; an operating-system crash releases the lock without manual cleanup.
 - Databases with a newer schema version are refused rather than migrated downward.
-- Tool calls are recorded before execution and resolved after. Unresolved calls are shown as uncertain actions on resume and are recorded as aborted only when the user says so. They are never re-executed.
+- Tool calls are recorded before execution and resolved after. Unresolved calls are shown as uncertain actions on resume and are recorded as aborted only when the user says so. They are never re-executed. Calls that never began are recorded as not executed. A session with an unresolved call refuses new turns until it is reconciled.
 
 ## Limits
 
