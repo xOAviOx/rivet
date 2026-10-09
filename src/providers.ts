@@ -460,3 +460,35 @@ export function createProvider(config: Config, key: string): Provider {
     },
   };
 }
+
+/** Capability check: a model that cannot call a tool must not be selected. */
+export async function probe(provider: Provider, signal: AbortSignal) {
+  const tool: ToolDefinition = {
+    name: "rivet_capability_check",
+    description: "Return the supplied word",
+    parameters: {
+      type: "object",
+      properties: { word: { type: "string" } },
+      required: ["word"],
+      additionalProperties: false,
+    },
+  };
+  const result = await provider.step(
+    "Call rivet_capability_check with word ready. Do not reply with text.",
+    [{ role: "user", content: "Check tool calling now." }],
+    [tool],
+    128,
+    signal,
+    () => {},
+  );
+  if (
+    !result.message.calls?.some(
+      (c: ToolCall) => c.name === tool.name && c.arguments.word === "ready",
+    )
+  )
+    throw new RivetError(
+      "Model did not pass the tool-calling check; configuration unchanged",
+      2,
+    );
+  return result.usage;
+}

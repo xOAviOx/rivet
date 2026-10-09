@@ -10,12 +10,19 @@ import {
 } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
-import type {
-  ToolCall,
-  ToolContext,
-  ToolDefinition,
-  ToolRunner,
-} from "./contracts.js";
+import type { ToolCall, ToolDefinition } from "./types.js";
+import { Policy } from "./security.js";
+
+/** Tool execution context; approval and mode policy are enforced by Policy. */
+export type ToolContext = {
+  workspace: string;
+  policy: Policy;
+  signal?: AbortSignal;
+};
+export interface ToolRunner {
+  definitions: ToolDefinition[];
+  execute(call: ToolCall, context: ToolContext): Promise<string>;
+}
 
 const MAX_FILE = 1024 * 1024;
 const MAX_OUTPUT = 48 * 1024;
@@ -105,6 +112,19 @@ const definitions: ToolDefinition[] = [
 function checkAbort(context: ToolContext): void {
   context.signal?.throwIfAborted();
 }
+/** Mode and allow/ask/deny decisions live at the policy boundary, not in tools. */
+async function check(
+  context: ToolContext,
+  call: ToolCall,
+  effect: "read" | "write" | "exec",
+): Promise<void> {
+  await context.policy.check(
+    call.name,
+    call.arguments,
+    effect,
+    context.signal ?? new AbortController().signal,
+  );
+}
 function stringArg(
   args: Record<string, unknown>,
   key: string,
@@ -143,15 +163,6 @@ function argv(args: Record<string, unknown>, key: string): string[] {
   )
     throw new Error(`${key} must contain at most 128 bounded strings`);
   return value as string[];
-}
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (value && typeof value === "object")
-    return `{${Object.entries(value)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`)
-      .join(",")}}`;
-  return JSON.stringify(value) ?? "null";
 }
 function sha256(contents: Buffer): string {
   return createHash("sha256").update(contents).digest("hex");
@@ -380,40 +391,6 @@ async function runProcess(
 }
 
 export function createToolRunner(): ToolRunner {
-  const grants = new WeakMap<ToolContext["approve"], Set<string>>();
-  async function approve(
-    call: ToolCall,
-    root: string,
-    context: ToolContext,
-  ): Promise<void> {
-    if (context.mode !== "edit")
-      throw new Error(`${call.name} requires edit mode`);
-    const key = canonical({
-      workspace: root,
-      tool: call.name,
-      arguments: call.arguments,
-    });
-    if (grants.get(context.approve)?.has(key)) return;
-    const decision = await context.approve({
-      tool: call.name,
-      arguments: structuredClone(call.arguments),
-      reason:
-        call.name === "file_patch"
-          ? "Modify a workspace file"
-          : "Execute a host process (not sandboxed)",
-    });
-    checkAbort(context);
-    if (decision !== "once" && decision !== "session")
-      throw new Error("Approval denied");
-    if (decision === "session") {
-      let allowed = grants.get(context.approve);
-      if (!allowed) {
-        allowed = new Set();
-        grants.set(context.approve, allowed);
-      }
-      allowed.add(key);
-    }
-  }
   return {
     definitions,
     async execute(input: ToolCall, context: ToolContext): Promise<string> {
@@ -524,7 +501,7 @@ export function createToolRunner(): ToolRunner {
               "A SHA-256 expectedHash is required, or null and empty oldText for creation",
             );
           const filename = await resolvePath(root, relative, create);
-          await approve(call, root, context);
+          await check(context, call, "write");
           checkAbort(context);
           await resolvePath(root, relative, create);
           let before: Buffer | undefined;
@@ -595,7 +572,7 @@ export function createToolRunner(): ToolRunner {
         if (call.name === "git") {
           if (processArgs.length === 0)
             throw new Error("git args must include a subcommand");
-          if (!readOnlyGit(processArgs)) await approve(call, root, context);
+          if (!readOnlyGit(processArgs)) await check(context, call, "exec");
           const safeArgs = [
             "--no-pager",
             "--no-optional-locks",
@@ -610,7 +587,7 @@ export function createToolRunner(): ToolRunner {
         const executable = stringArg(args, "command");
         if (!executable || executable.length > 4096)
           throw new Error("command must contain 1 to 4096 characters");
-        await approve(call, root, context);
+        await check(context, call, "exec");
         return await runProcess(
           executable,
           processArgs,
