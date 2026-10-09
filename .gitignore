@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.cache/
+.pnpm-store/
+*.tgz
+coverage/
+.rivet/
+*.db*
+.env*
