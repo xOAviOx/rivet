@@ -352,3 +352,129 @@ test("junctions and symlinks are never followed", async (t) => {
   );
   assert.deepEqual(readdirSync(env.outside), ["secret.txt"]);
 });
+
+test("plan mode reads freely and denies writes and commands without prompting", async (t) => {
+  const env = setup(t);
+  writeFileSync(join(env.root, "a.txt"), "alpha\n");
+  const marker = join(env.root, "marker.txt");
+  const { run, prompts, events } = tools(env.root, {
+    mode: "plan",
+    answers: Array(5).fill("session"),
+  });
+  const read = await run("file_read", { path: "a.txt" });
+  assert.deepEqual(read, {
+    path: "a.txt",
+    sha256: sha256("alpha\n"),
+    contents: "alpha\n",
+    truncated: false,
+  });
+  assert.match(
+    (
+      await run("file_patch", {
+        path: "a.txt",
+        expectedHash: read.sha256,
+        oldText: "alpha",
+        newText: "beta",
+      })
+    ).error,
+    /Policy denies file_patch/,
+  );
+  assert.match(
+    (
+      await run("file_patch", {
+        path: "b.txt",
+        expectedHash: null,
+        oldText: "",
+        newText: "x",
+        create: true,
+      })
+    ).error,
+    /Policy denies file_patch/,
+  );
+  assert.match(
+    (
+      await run("command", {
+        command: node,
+        args: [
+          "-e",
+          `require("fs").writeFileSync(${JSON.stringify(marker)}, "ran")`,
+        ],
+      })
+    ).error,
+    /Policy denies command/,
+  );
+  assert.equal(readFileSync(join(env.root, "a.txt"), "utf8"), "alpha\n");
+  assert.equal(existsSync(join(env.root, "b.txt")), false);
+  assert.equal(existsSync(marker), false);
+  assert.equal(prompts.length, 0);
+  assert.deepEqual(events, []);
+});
+
+test("edit mode prompts with exact arguments; once, session, and deny differ", async (t) => {
+  const env = setup(t);
+  const { run, prompts, events } = tools(env.root, {
+    answers: ["deny", "once", "once", "session", "once"],
+  });
+  const args = { command: node, args: ["-e", "process.stdout.write('ok')"] };
+  assert.match(
+    (await run("command", args)).error,
+    /Approval denied for command/,
+  );
+  const once = await run("command", args);
+  assert.equal(once.exitCode, 0);
+  assert.equal(once.output, "ok");
+  assert.equal((await run("command", args)).output, "ok");
+  assert.equal(prompts.length, 3, "once does not persist");
+  assert.equal((await run("command", args)).output, "ok");
+  assert.equal((await run("command", args)).output, "ok");
+  assert.equal(prompts.length, 4, "session persists for identical arguments");
+  const other = {
+    command: node,
+    args: ["-e", "process.stdout.write('other')"],
+  };
+  assert.equal((await run("command", other)).output, "other");
+  assert.equal(prompts.length, 5, "session grants do not cover new arguments");
+  assert.deepEqual(
+    prompts.map((prompt) => prompt.name),
+    Array(5).fill("command"),
+  );
+  assert.deepEqual(prompts[0].args, args);
+  assert.deepEqual(prompts[4].args, other);
+  assert.deepEqual(events.slice(0, 2), [
+    { type: "approval", tool: "command", args },
+    { type: "approval", tool: "command", args, decision: "deny" },
+  ]);
+});
+
+test("custom policy rules allow, deny, or ask per tool", async (t) => {
+  const env = setup(t);
+  writeFileSync(join(env.root, "a.txt"), "alpha\n");
+  const { run, prompts } = tools(env.root, {
+    mode: "custom",
+    policy: { command: "allow", file_patch: "deny" },
+    answers: ["deny"],
+  });
+  assert.equal(
+    (
+      await run("command", {
+        command: node,
+        args: ["-e", "process.stdout.write('allowed')"],
+      })
+    ).output,
+    "allowed",
+  );
+  assert.equal(prompts.length, 0);
+  assert.match(
+    (
+      await run("file_patch", {
+        path: "a.txt",
+        expectedHash: sha256("alpha\n"),
+        oldText: "alpha",
+        newText: "beta",
+      })
+    ).error,
+    /Policy denies file_patch/,
+  );
+  assert.equal(prompts.length, 0);
+  assert.equal(readFileSync(join(env.root, "a.txt"), "utf8"), "alpha\n");
+});
