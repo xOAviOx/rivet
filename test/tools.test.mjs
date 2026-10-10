@@ -667,3 +667,327 @@ test("file_search matches literal text with bounded results", async (t) => {
   assert.equal(limited.truncated, true);
   assert.deepEqual((await run("file_search", { query: "zzz" })).matches, []);
 });
+
+test("command runs without a shell and reports exit status and bounded output", async (t) => {
+  const env = setup(t);
+  mkdirSync(join(env.root, "sub"));
+  const { run } = tools(env.root, { answers: Array(10).fill("once") });
+  const literal = "a & echo injected | more > out.txt";
+  assert.equal(
+    (
+      await run("command", {
+        command: node,
+        args: ["-e", "process.stdout.write(process.argv[1])", literal],
+      })
+    ).output,
+    literal,
+  );
+  assert.equal(existsSync(join(env.root, "out.txt")), false);
+  const failed = await run("command", {
+    command: node,
+    args: ["-e", "process.stderr.write('bad'); process.exit(3)"],
+  });
+  assert.equal(failed.exitCode, 3);
+  assert.equal(failed.output, "bad");
+  const big = await run("command", {
+    command: node,
+    args: ["-e", "process.stdout.write('x'.repeat(100000))"],
+  });
+  assert.equal(big.exitCode, 0);
+  assert.equal(big.truncated, true);
+  assert.equal(big.output.length, 48 * 1024);
+  const cwd = await run("command", {
+    command: node,
+    args: ["-e", "process.stdout.write(process.cwd())"],
+    cwd: "sub",
+  });
+  assert.equal(
+    cwd.output.toLowerCase(),
+    realpathSync.native(join(env.root, "sub")).toLowerCase(),
+  );
+  assert.ok(
+    (await run("command", { command: `rivet-missing-${randomUUID()}` })).error,
+  );
+});
+
+test(
+  "timeouts and cancellation stop the whole process tree",
+  { timeout: 90000 },
+  async (t) => {
+    const env = setup(t);
+    const pids = [];
+    t.after(() => {
+      for (const pid of pids)
+        try {
+          process.kill(pid);
+        } catch {
+          // Already stopped.
+        }
+    });
+    const keepAlive = "setInterval(() => {}, 1000)";
+    const tree = (pidFile) =>
+      [
+        `const c = require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(keepAlive)}], { stdio: "inherit" });`,
+        `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));`,
+        keepAlive,
+      ].join("\n");
+    const { run } = tools(env.root, { answers: Array(4).fill("once") });
+
+    let started = Date.now();
+    const timedOut = await run("command", {
+      command: node,
+      args: ["-e", tree("timeout.pid")],
+      timeoutMs: 2000,
+    });
+    assert.equal(timedOut.stopped, "timeout");
+    assert.ok(Date.now() - started < 20000, "timeout settles promptly");
+    const timeoutChild = Number(
+      readFileSync(join(env.root, "timeout.pid"), "utf8"),
+    );
+    pids.push(timeoutChild);
+    assert.ok(
+      await waitFor(() => !alive(timeoutChild)),
+      "descendant stopped after timeout",
+    );
+
+    const controller = new AbortController();
+    started = Date.now();
+    const pending = run(
+      "command",
+      { command: node, args: ["-e", tree("cancel.pid")] },
+      controller.signal,
+    );
+    assert.ok(await waitFor(() => existsSync(join(env.root, "cancel.pid"))));
+    controller.abort();
+    const cancelled = await pending;
+    assert.equal(cancelled.stopped, "cancelled");
+    assert.ok(Date.now() - started < 20000, "cancellation settles promptly");
+    const cancelChild = Number(
+      readFileSync(join(env.root, "cancel.pid"), "utf8"),
+    );
+    pids.push(cancelChild);
+    assert.ok(
+      await waitFor(() => !alive(cancelChild)),
+      "descendant stopped after cancellation",
+    );
+
+    const aborted = new AbortController();
+    aborted.abort();
+    const marker = join(env.root, "never.txt");
+    assert.ok(
+      (
+        await run(
+          "command",
+          {
+            command: node,
+            args: [
+              "-e",
+              `require("fs").writeFileSync(${JSON.stringify(marker)}, "x")`,
+            ],
+          },
+          aborted.signal,
+        )
+      ).error,
+    );
+    assert.equal(existsSync(marker), false);
+  },
+);
+
+test(
+  "read-only Git runs in plan mode without repository helpers; other Git needs approval",
+  { skip: !gitAvailable && "git is not installed", timeout: 60000 },
+  async (t) => {
+    const env = setup(t);
+    const git = initRepository(env.root);
+    writeFileSync(join(env.root, "a.txt"), "two\n");
+    const marker = join(env.outside, "external-diff-ran");
+    const script = join(env.outside, "external.js");
+    writeFileSync(
+      script,
+      `require("fs").writeFileSync(${JSON.stringify(marker)}, "ran")`,
+    );
+    git("config", "diff.external", `"${forward(node)}" "${forward(script)}"`);
+    git("diff");
+    assert.ok(existsSync(marker), "control: plain git diff runs diff.external");
+    rmSync(marker);
+
+    const plan = tools(env.root, { mode: "plan" });
+    const status = await plan.run("git", { args: ["status", "--short"] });
+    assert.equal(status.exitCode, 0);
+    assert.match(status.output, /a\.txt/);
+    const diff = await plan.run("git", { args: ["diff", "--no-color"] });
+    assert.equal(diff.exitCode, 0);
+    assert.match(diff.output, /^-one$/m);
+    assert.match(diff.output, /^\+two$/m);
+    assert.equal(existsSync(marker), false, "diff.external must not run");
+    assert.match(
+      (await plan.run("git", { args: ["log", "--oneline", "-1"] })).output,
+      /initial/,
+    );
+    assert.match(
+      (await plan.run("git", { args: ["commit", "-qam", "plan"] })).error,
+      /Policy denies git/,
+    );
+    assert.match(
+      (await plan.run("git", { args: ["diff", "--output=leak.txt"] })).error,
+      /Policy denies git/,
+    );
+    assert.equal(existsSync(join(env.root, "leak.txt")), false);
+    assert.equal(plan.prompts.length, 0);
+    assert.equal(git("rev-list", "--count", "HEAD").trim(), "1");
+
+    const edit = tools(env.root, { answers: ["deny", "once"] });
+    const commit = { args: ["commit", "-qam", "second"] };
+    assert.match((await edit.run("git", commit)).error, /Approval denied/);
+    assert.equal(git("rev-list", "--count", "HEAD").trim(), "1");
+    assert.equal((await edit.run("git", commit)).exitCode, 0);
+    assert.equal(git("rev-list", "--count", "HEAD").trim(), "2");
+    assert.deepEqual(
+      edit.prompts.map((prompt) => prompt.args),
+      [commit, commit],
+    );
+  },
+);
+
+test(
+  "read-only Git does not run a repository fsmonitor hook",
+  { skip: !gitAvailable && "git is not installed", timeout: 60000 },
+  async (t) => {
+    const env = setup(t);
+    const git = initRepository(env.root);
+    const marker = join(env.outside, "fsmonitor-ran");
+    const script = join(env.outside, "fsmonitor.js");
+    writeFileSync(
+      script,
+      `require("fs").writeFileSync(${JSON.stringify(marker)}, "ran")`,
+    );
+    git("config", "core.fsmonitor", `"${forward(node)}" "${forward(script)}"`);
+    try {
+      git("status", "--short");
+    } catch {
+      // The hook output is not a valid fsmonitor response; only execution matters.
+    }
+    if (!existsSync(marker)) {
+      t.skip("this Git version does not run core.fsmonitor hooks for status");
+      return;
+    }
+    rmSync(marker);
+    const { run } = tools(env.root, { mode: "plan" });
+    assert.equal(
+      (await run("git", { args: ["status", "--short"] })).exitCode,
+      0,
+    );
+    assert.equal(existsSync(marker), false);
+  },
+);
+
+// Regression coverage for the tool-boundary defects recorded in PROGRESS.md.
+
+test(
+  "environment and credential files are refused like other protected paths",
+  async (t) => {
+    const env = setup(t);
+    writeFileSync(join(env.root, ".env"), "API_KEY=sk-rivet-test-value\n");
+    writeFileSync(join(env.root, ".env.local"), "TOKEN=value\n");
+    mkdirSync(join(env.root, ".ssh"));
+    writeFileSync(join(env.root, ".ssh", "id_ed25519"), "private\n");
+    const { run } = tools(env.root, { mode: "plan" });
+    for (const path of [".env", ".env.local", ".ssh/id_ed25519"])
+      assert.ok((await run("file_read", { path })).error, path);
+    assert.deepEqual((await run("file_list", {})).files, []);
+    assert.deepEqual((await run("file_search", { query: "=" })).matches, []);
+  },
+);
+
+test(
+  "hard links to files outside the workspace are refused",
+  async (t) => {
+    const env = setup(t);
+    try {
+      linkSync(join(env.outside, "secret.txt"), join(env.root, "alias.txt"));
+    } catch {
+      t.skip("hard links are unavailable on this file system");
+      return;
+    }
+    const { run } = tools(env.root, { mode: "plan" });
+    assert.ok((await run("file_read", { path: "alias.txt" })).error);
+    assert.deepEqual(
+      (await run("file_search", { query: "secret" })).matches,
+      [],
+    );
+  },
+);
+
+test(
+  "Windows 8.3 short names cannot alias .git",
+  {
+    skip: process.platform !== "win32" && "Windows only",
+  },
+  async (t) => {
+    const env = setup(t);
+    mkdirSync(join(env.root, ".git", "hooks"), { recursive: true });
+    writeFileSync(join(env.root, ".git", "config"), "[core]\n");
+    if (!existsSync(join(env.root, "GIT~1", "config"))) {
+      t.skip("8.3 short names are disabled on this volume");
+      return;
+    }
+    const { run } = tools(env.root, { answers: ["once"] });
+    assert.ok((await run("file_read", { path: "GIT~1/config" })).error);
+    assert.ok(
+      (
+        await run("file_patch", {
+          path: "GIT~1/hooks/pre-commit",
+          expectedHash: null,
+          oldText: "",
+          newText: "#!/bin/sh\n",
+          create: true,
+        })
+      ).error,
+    );
+    assert.equal(
+      existsSync(join(env.root, ".git", "hooks", "pre-commit")),
+      false,
+    );
+  },
+);
+
+test(
+  "commands do not inherit provider credentials from the agent process",
+  async (t) => {
+    const env = setup(t);
+    const name = "RIVET_TOOLS_TEST_API_KEY";
+    process.env[name] = `sk-rivet-test-${randomUUID()}`;
+    t.after(() => delete process.env[name]);
+    const { run } = tools(env.root, { answers: ["once"] });
+    const result = await run("command", {
+      command: node,
+      args: ["-e", `process.stdout.write(process.env.${name} ?? "absent")`],
+    });
+    assert.equal(result.output, "absent");
+  },
+);
+
+test(
+  "custom policy rules also govern read tools and read-only Git",
+  async (t) => {
+    const env = setup(t);
+    writeFileSync(join(env.root, "a.txt"), "alpha\n");
+    const { run, prompts } = tools(env.root, {
+      mode: "custom",
+      policy: {
+        file_read: "deny",
+        file_list: "deny",
+        file_search: "deny",
+        git: "deny",
+      },
+    });
+    for (const [name, args] of [
+      ["file_read", { path: "a.txt" }],
+      ["file_list", {}],
+      ["file_search", { query: "alpha" }],
+      ["git", { args: ["status", "--short"] }],
+    ])
+      assert.match((await run(name, args)).error ?? "", /Policy denies/, name);
+    assert.equal(prompts.length, 0);
+  },
+);
