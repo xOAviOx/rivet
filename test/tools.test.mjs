@@ -579,8 +579,8 @@ test("file_patch creation never overwrites and never creates directories", async
     readFileSync(join(env.root, "src", "new.txt"), "utf8"),
     "hello\n",
   );
-  assert.equal(prompts.length, 4);
-  assert.deepEqual(prompts[2].args, {
+  assert.equal(prompts.length, 1, "invalid creations fail before approval");
+  assert.deepEqual(prompts[0].args, {
     path: "src/new.txt",
     expectedHash: null,
     oldText: "",
@@ -883,40 +883,31 @@ test(
 
 // Regression coverage for the tool-boundary defects recorded in PROGRESS.md.
 
-test(
-  "environment and credential files are refused like other protected paths",
-  async (t) => {
-    const env = setup(t);
-    writeFileSync(join(env.root, ".env"), "API_KEY=sk-rivet-test-value\n");
-    writeFileSync(join(env.root, ".env.local"), "TOKEN=value\n");
-    mkdirSync(join(env.root, ".ssh"));
-    writeFileSync(join(env.root, ".ssh", "id_ed25519"), "private\n");
-    const { run } = tools(env.root, { mode: "plan" });
-    for (const path of [".env", ".env.local", ".ssh/id_ed25519"])
-      assert.ok((await run("file_read", { path })).error, path);
-    assert.deepEqual((await run("file_list", {})).files, []);
-    assert.deepEqual((await run("file_search", { query: "=" })).matches, []);
-  },
-);
+test("environment and credential files are refused like other protected paths", async (t) => {
+  const env = setup(t);
+  writeFileSync(join(env.root, ".env"), "API_KEY=sk-rivet-test-value\n");
+  writeFileSync(join(env.root, ".env.local"), "TOKEN=value\n");
+  mkdirSync(join(env.root, ".ssh"));
+  writeFileSync(join(env.root, ".ssh", "id_ed25519"), "private\n");
+  const { run } = tools(env.root, { mode: "plan" });
+  for (const path of [".env", ".env.local", ".ssh/id_ed25519"])
+    assert.ok((await run("file_read", { path })).error, path);
+  assert.deepEqual((await run("file_list", {})).files, []);
+  assert.deepEqual((await run("file_search", { query: "=" })).matches, []);
+});
 
-test(
-  "hard links to files outside the workspace are refused",
-  async (t) => {
-    const env = setup(t);
-    try {
-      linkSync(join(env.outside, "secret.txt"), join(env.root, "alias.txt"));
-    } catch {
-      t.skip("hard links are unavailable on this file system");
-      return;
-    }
-    const { run } = tools(env.root, { mode: "plan" });
-    assert.ok((await run("file_read", { path: "alias.txt" })).error);
-    assert.deepEqual(
-      (await run("file_search", { query: "secret" })).matches,
-      [],
-    );
-  },
-);
+test("hard links to files outside the workspace are refused", async (t) => {
+  const env = setup(t);
+  try {
+    linkSync(join(env.outside, "secret.txt"), join(env.root, "alias.txt"));
+  } catch {
+    t.skip("hard links are unavailable on this file system");
+    return;
+  }
+  const { run } = tools(env.root, { mode: "plan" });
+  assert.ok((await run("file_read", { path: "alias.txt" })).error);
+  assert.deepEqual((await run("file_search", { query: "secret" })).matches, []);
+});
 
 test(
   "Windows 8.3 short names cannot alias .git",
@@ -951,43 +942,51 @@ test(
   },
 );
 
-test(
-  "commands do not inherit provider credentials from the agent process",
-  async (t) => {
-    const env = setup(t);
-    const name = "RIVET_TOOLS_TEST_API_KEY";
-    process.env[name] = `sk-rivet-test-${randomUUID()}`;
-    t.after(() => delete process.env[name]);
-    const { run } = tools(env.root, { answers: ["once"] });
-    const result = await run("command", {
-      command: node,
-      args: ["-e", `process.stdout.write(process.env.${name} ?? "absent")`],
-    });
-    assert.equal(result.output, "absent");
-  },
-);
+test("commands do not inherit provider credentials from the agent process", async (t) => {
+  const env = setup(t);
+  const name = "RIVET_TOOLS_TEST_API_KEY";
+  process.env[name] = `sk-rivet-test-${randomUUID()}`;
+  t.after(() => delete process.env[name]);
+  const { run } = tools(env.root, { answers: ["once"] });
+  const result = await run("command", {
+    command: node,
+    args: ["-e", `process.stdout.write(process.env.${name} ?? "absent")`],
+  });
+  assert.equal(result.output, "absent");
+});
 
-test(
-  "custom policy rules also govern read tools and read-only Git",
-  async (t) => {
-    const env = setup(t);
-    writeFileSync(join(env.root, "a.txt"), "alpha\n");
-    const { run, prompts } = tools(env.root, {
-      mode: "custom",
-      policy: {
-        file_read: "deny",
-        file_list: "deny",
-        file_search: "deny",
-        git: "deny",
-      },
-    });
-    for (const [name, args] of [
-      ["file_read", { path: "a.txt" }],
-      ["file_list", {}],
-      ["file_search", { query: "alpha" }],
-      ["git", { args: ["status", "--short"] }],
-    ])
-      assert.match((await run(name, args)).error ?? "", /Policy denies/, name);
-    assert.equal(prompts.length, 0);
-  },
-);
+test("custom policy rules also govern read tools and read-only Git", async (t) => {
+  const env = setup(t);
+  writeFileSync(join(env.root, "a.txt"), "alpha\n");
+  const { run, prompts } = tools(env.root, {
+    mode: "custom",
+    policy: {
+      file_read: "deny",
+      file_list: "deny",
+      file_search: "deny",
+      git: "deny",
+    },
+  });
+  for (const [name, args] of [
+    ["file_read", { path: "a.txt" }],
+    ["file_list", {}],
+    ["file_search", { query: "alpha" }],
+    ["git", { args: ["status", "--short"] }],
+  ])
+    assert.match((await run(name, args)).error ?? "", /Policy denies/, name);
+  assert.equal(prompts.length, 0);
+  const asking = tools(env.root, {
+    mode: "custom",
+    policy: { file_read: "ask" },
+    answers: ["deny", "once"],
+  });
+  assert.match(
+    (await asking.run("file_read", { path: "a.txt" })).error,
+    /Approval denied/,
+  );
+  assert.equal(
+    (await asking.run("file_read", { path: "a.txt" })).contents,
+    "alpha\n",
+  );
+  assert.equal(asking.prompts.length, 2);
+});

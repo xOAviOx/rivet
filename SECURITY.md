@@ -25,6 +25,7 @@ All tool paths are relative to the workspace root, which is the real path of the
 
 - Refused outright: NUL bytes, absolute paths, drive letters, UNC paths, `..` segments.
 - Protected names anywhere in a path: `.git`, `.rivet`, `.ssh`, `.aws`, `.codex`, `.agents`, `.env` and `.env.*`.
+- Windows short-name spellings such as `GIT~1` and `SECRET~1.TXT` are refused on every platform, including ordinary filenames matching that pattern. Canonical path components are also checked for protected names.
 - Windows: reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, with or without extension), characters `: * ? < > |`, and trailing dots or spaces are refused on every platform so a repository stays portable.
 - Every component of a path is `lstat`ed. Symbolic links and junctions are not followed. Files with more than one hard link are refused. The resolved real path must stay under the root.
 - Missing paths are accepted only for the final component and only when the tool creates files.
@@ -59,6 +60,7 @@ Read-only Git is a fixed allowlist of subcommands with flag checks (for example 
 - Keys come from an environment variable, the OS credential store (macOS Keychain, libsecret, Windows PasswordVault), or `/key` for the lifetime of one process. The configuration file holds only the variable name and is written with mode `0600` inside a `0700` directory that must not be a symlink.
 - Keys are validated for shape (no line breaks) before use and are never printed. Provider error bodies and fetch error messages are discarded because they can echo headers.
 - Exports redact every environment value whose name contains `KEY`, `TOKEN`, `SECRET`, or `PASSWORD`, the process-only `/key` value, and anything shaped like `sk-...` or `Bearer ...`.
+- Tool results are redacted before storage, output events, and subsequent provider requests using the environment/key-pattern redactor and the active provider credential. This does not detect arbitrary secrets in ordinary project files.
 - OS credential helpers receive no model-controlled arguments; the account name is the SHA-256 of the destination URL.
 
 ## Network

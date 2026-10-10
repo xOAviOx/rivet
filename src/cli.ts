@@ -170,6 +170,7 @@ async function runTurn(
     {
       config: ctx.config,
       provider: createProvider(ctx.config, key),
+      secrets: [key],
       store: ctx.store,
       session: ctx.session,
       workspace: ctx.workspace,

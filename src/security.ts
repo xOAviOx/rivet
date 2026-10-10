@@ -47,6 +47,7 @@ export class Workspace {
       parts.some(
         (p) =>
           blocked(p) ||
+          /~\d+(?:\.|$)/.test(p) ||
           p === ".." ||
           (/[:*?<>|]|[. ]$/.test(p) && p !== ".") ||
           /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p),
@@ -62,8 +63,11 @@ export class Workspace {
         const info = await lstat(current);
         if (info.isSymbolicLink())
           throw new RivetError("Symlinks and junctions are not followed");
-        if (!this.contains(await realpath(current)))
+        const canonical = await realpath(current);
+        if (!this.contains(canonical))
           throw new RivetError("Resolved path leaves workspace");
+        if (relative(this.root, canonical).split(sep).some(blocked))
+          throw new RivetError("Protected or unsafe path");
         if (info.isFile() && info.nlink > 1)
           throw new RivetError("Hard-linked files are not supported");
       } catch (e) {

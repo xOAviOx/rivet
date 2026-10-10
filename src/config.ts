@@ -9,6 +9,7 @@ const endpoint = z
   .string()
   .url()
   .refine((value) => {
+    if (!URL.canParse(value)) return false;
     const u = new URL(value);
     return (
       !u.username &&

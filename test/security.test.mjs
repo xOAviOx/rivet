@@ -60,6 +60,8 @@ test("workspace protects Git internals, state, secrets, and reserved Windows nam
   const ws = await Workspace.open(root);
   for (const input of [
     ".git/config",
+    "GIT~1/config",
+    "nested/SECRET~1.TXT",
     "sub/.git/HEAD",
     ".rivet/sessions.db",
     ".ssh/id_rsa",

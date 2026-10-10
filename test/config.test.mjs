@@ -116,18 +116,13 @@ test("endpoints require HTTPS or loopback HTTP and forbid credentials, queries, 
   );
 });
 
-// Zod 4 runs the endpoint refine even after .url() fails, so `new URL` throws instead of
-// producing an issue. Tracked for the config owner; becomes a normal test once fixed.
-test(
-  "an unparsable endpoint is a validation issue, not a thrown TypeError",
-  { todo: true },
-  () => {
-    const result = configSchema.safeParse(
-      valid({ provider: "compatible", endpoint: "not a url" }),
-    );
-    assert.equal(result.success, false);
-  },
-);
+// Zod runs refinements even after the URL shape check fails.
+test("an unparsable endpoint is a validation issue, not a thrown TypeError", () => {
+  const result = configSchema.safeParse(
+    valid({ provider: "compatible", endpoint: "not a url" }),
+  );
+  assert.equal(result.success, false);
+});
 
 test("compatible providers need an endpoint and official providers refuse one", () => {
   assert.match(issues(valid({ provider: "compatible" })), /explicit endpoint/);

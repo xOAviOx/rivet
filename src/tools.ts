@@ -11,7 +11,8 @@ import {
 import { constants } from "node:fs";
 import path from "node:path";
 import type { ToolCall, ToolDefinition } from "./types.js";
-import { Policy } from "./security.js";
+import { Policy, Workspace } from "./security.js";
+import { childEnvironment } from "./process.js";
 
 /** Tool execution context; approval and mode policy are enforced by Policy. */
 export type ToolContext = {
@@ -27,7 +28,6 @@ export interface ToolRunner {
 const MAX_FILE = 1024 * 1024;
 const MAX_OUTPUT = 48 * 1024;
 const MAX_ENTRIES = 2000;
-const protectedNames = new Set([".git", ".rivet"]);
 
 function schema(
   properties: Record<string, unknown>,
@@ -170,47 +170,13 @@ function sha256(contents: Buffer): string {
 function isMissing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
-function safeRelative(input: string): string {
-  if (
-    input.length > 4096 ||
-    path.isAbsolute(input) ||
-    /^[a-z]:/i.test(input) ||
-    input.startsWith("\\") ||
-    input.includes(":")
-  )
-    throw new Error("Path must be relative to the workspace");
-  const parts = input.split(/[\\/]+/);
-  if (
-    parts.some(
-      (part) =>
-        part === ".." ||
-        protectedNames.has(part.toLowerCase()) ||
-        (/[. ]$/.test(part) && part !== ".") ||
-        /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part),
-    )
-  )
-    throw new Error("Protected or unsafe workspace path");
-  return parts.filter((part) => part !== "." && part !== "").join(path.sep);
-}
 async function resolvePath(
   root: string,
   input: string,
   allowMissing = false,
 ): Promise<string> {
-  const relative = safeRelative(input);
-  let current = root;
-  for (const part of relative.split(path.sep).filter(Boolean)) {
-    current = path.join(current, part);
-    try {
-      const stat = await lstat(current);
-      if (stat.isSymbolicLink())
-        throw new Error("Symlinks are not allowed in workspace tool paths");
-    } catch (error) {
-      if (allowMissing && isMissing(error)) continue;
-      throw error;
-    }
-  }
-  return current;
+  if (input.length > 4096) throw new Error("Path exceeds 4096 characters");
+  return (await Workspace.open(root)).path(input, allowMissing);
 }
 async function readFileBounded(filename: string): Promise<Buffer> {
   const handle = await open(
@@ -220,6 +186,7 @@ async function readFileBounded(filename: string): Promise<Buffer> {
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error("Path is not a regular file");
+    if (stat.nlink > 1) throw new Error("Hard-linked files are not supported");
     if (stat.size > MAX_FILE) throw new Error("File exceeds the 1 MiB limit");
     const buffer = Buffer.alloc(MAX_FILE + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
@@ -245,6 +212,11 @@ async function walk(
   while (pending.length) {
     checkAbort(context);
     const current = pending.pop()!;
+    try {
+      await resolvePath(root, path.relative(root, current));
+    } catch {
+      continue;
+    }
     const stat = await lstat(current);
     if (stat.isSymbolicLink()) continue;
     if (stat.isFile()) {
@@ -257,7 +229,6 @@ async function walk(
       for (const entry of entries) {
         if (++visited > MAX_ENTRIES) return { files, truncated: true };
         if (
-          protectedNames.has(entry.name.toLowerCase()) ||
           ["node_modules", ".pnpm", "dist"].includes(entry.name) ||
           entry.isSymbolicLink()
         )
@@ -313,12 +284,11 @@ async function runProcess(
       windowsHide: true,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
+      env: childEnvironment({
         GIT_TERMINAL_PROMPT: "0",
         GIT_PAGER: "cat",
         PAGER: "cat",
-      },
+      }),
     });
     let output = "";
     let bytes = 0;
@@ -427,11 +397,14 @@ export function createToolRunner(): ToolRunner {
             100,
             call.name === "file_list" ? 500 : 200,
           );
-          if (call.name === "file_list")
+          if (call.name === "file_list") {
+            await check(context, call, "read");
             return JSON.stringify(await walk(root, start, limit, context));
+          }
           const query = stringArg(args, "query");
           if (!query || query.length > 4096)
             throw new Error("query must contain 1 to 4096 characters");
+          await check(context, call, "read");
           const listing = await walk(root, start, 256, context);
           const matches: Array<{ path: string; line: number; text: string }> =
             [];
@@ -473,6 +446,8 @@ export function createToolRunner(): ToolRunner {
         }
         if (call.name === "file_read") {
           const filename = await resolvePath(root, stringArg(args, "path"));
+          await check(context, call, "read");
+          await resolvePath(root, stringArg(args, "path"));
           const buffer = await readFileBounded(filename);
           const contents = utf8(buffer);
           return JSON.stringify({
@@ -484,8 +459,6 @@ export function createToolRunner(): ToolRunner {
         }
         if (call.name === "file_patch") {
           const relative = stringArg(args, "path");
-          if (!safeRelative(relative))
-            throw new Error("Cannot patch the workspace root");
           const oldText = stringArg(args, "oldText");
           const newText = stringArg(args, "newText");
           if (args.create !== undefined && typeof args.create !== "boolean")
@@ -501,6 +474,16 @@ export function createToolRunner(): ToolRunner {
               "A SHA-256 expectedHash is required, or null and empty oldText for creation",
             );
           const filename = await resolvePath(root, relative, create);
+          if (filename === root)
+            throw new Error("Cannot patch the workspace root");
+          if (create) {
+            try {
+              await lstat(filename);
+              throw new Error("File already exists");
+            } catch (error) {
+              if (!isMissing(error)) throw error;
+            }
+          }
           await check(context, call, "write");
           checkAbort(context);
           await resolvePath(root, relative, create);
@@ -572,7 +555,11 @@ export function createToolRunner(): ToolRunner {
         if (call.name === "git") {
           if (processArgs.length === 0)
             throw new Error("git args must include a subcommand");
-          if (!readOnlyGit(processArgs)) await check(context, call, "exec");
+          await check(
+            context,
+            call,
+            readOnlyGit(processArgs) ? "read" : "exec",
+          );
           const safeArgs = [
             "--no-pager",
             "--no-optional-locks",

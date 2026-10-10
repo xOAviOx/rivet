@@ -10,6 +10,7 @@ import { RivetError, errorText } from "./types.js";
 import type { Config } from "./config.js";
 import { compact, estimate } from "./context.js";
 import type { Policy, Workspace } from "./security.js";
+import { redact } from "./security.js";
 import type { Session, Store } from "./store.js";
 import { createToolRunner, type ToolContext } from "./tools.js";
 import { loadInstructions } from "./instructions.js";
@@ -42,6 +43,7 @@ export interface AgentOptions {
   workspace: Workspace;
   policy: Policy;
   mcp?: McpTools;
+  secrets?: string[];
   signal: AbortSignal;
   emit: Emit;
 }
@@ -197,11 +199,22 @@ export async function runAgent(
           result = await execute(call);
           if (typeof result !== "string" || !result)
             throw new Error("Tool returned no result");
-          if (JSON.parse(result).error === true) error = true;
+          // MCP tools may return plain text; built-in failures use JSON envelopes.
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(result);
+          } catch {
+            parsed = undefined;
+          }
+          if (parsed && typeof parsed === "object" && "error" in parsed)
+            error = parsed.error === true || typeof parsed.error === "string";
         } catch (e) {
           result = JSON.stringify({ error: errorText(e) });
           error = true;
         }
+        result = redact(result);
+        for (const secret of options.secrets ?? [])
+          if (secret) result = result.split(secret).join("[REDACTED]");
         store.finish(actionId, result);
         emitAll({ type: "tool.end", id: call.id, result, error });
         const toolMessage: Message = {
