@@ -478,3 +478,192 @@ test("custom policy rules allow, deny, or ask per tool", async (t) => {
   assert.equal(prompts.length, 0);
   assert.equal(readFileSync(join(env.root, "a.txt"), "utf8"), "alpha\n");
 });
+
+test("file_patch replaces exactly one literal match against the expected hash", async (t) => {
+  const env = setup(t);
+  const file = join(env.root, "notes.txt");
+  const original = "one\r\ntwo\r\nthree\r\n";
+  writeFileSync(file, original);
+  const { run } = tools(env.root, { answers: Array(20).fill("once") });
+  const patch = (args) =>
+    run("file_patch", {
+      path: "notes.txt",
+      expectedHash: sha256(original),
+      ...args,
+    });
+  assert.match(
+    (await patch({ expectedHash: sha256("x"), oldText: "two", newText: "2" }))
+      .error,
+    /expectedHash does not match/,
+  );
+  assert.match(
+    (await patch({ oldText: "four", newText: "4" })).error,
+    /exactly once/,
+  );
+  assert.match(
+    (await patch({ oldText: "", newText: "4" })).error,
+    /exactly once/,
+  );
+  assert.match(
+    (await patch({ oldText: "\r\n", newText: "\n" })).error,
+    /exactly once/,
+  );
+  assert.equal(readFileSync(file, "utf8"), original);
+
+  const result = await patch({ oldText: "two", newText: "$& and $1" });
+  const expected = "one\r\n$& and $1\r\nthree\r\n";
+  assert.equal(readFileSync(file, "utf8"), expected);
+  assert.deepEqual(result, {
+    path: "notes.txt",
+    sha256: sha256(expected),
+    bytes: Buffer.byteLength(expected),
+    created: false,
+  });
+  assert.equal(
+    (await run("file_read", { path: "notes.txt" })).sha256,
+    result.sha256,
+  );
+  assert.match(
+    (await patch({ oldText: "one", newText: "1" })).error,
+    /expectedHash does not match/,
+    "a hash cannot be reused after the file changes",
+  );
+  assert.match(
+    (
+      await run("file_patch", {
+        path: "notes.txt",
+        expectedHash: result.sha256,
+        oldText: "one",
+        newText: "x".repeat(1024 * 1024),
+      })
+    ).error,
+    /1 MiB/,
+  );
+  assert.equal(readFileSync(file, "utf8"), expected);
+  assert.deepEqual(readdirSync(env.root), ["notes.txt"], "no temporary files");
+});
+
+test("file_patch creation never overwrites and never creates directories", async (t) => {
+  const env = setup(t);
+  writeFileSync(join(env.root, "existing.txt"), "keep\n");
+  const { run, prompts } = tools(env.root, { answers: Array(10).fill("once") });
+  const create = (path, newText = "hello\n") =>
+    run("file_patch", {
+      path,
+      expectedHash: null,
+      oldText: "",
+      newText,
+      create: true,
+    });
+  assert.ok((await create("src/new.txt")).error);
+  assert.equal(existsSync(join(env.root, "src")), false);
+  assert.ok((await create("existing.txt", "replaced\n")).error);
+  assert.equal(readFileSync(join(env.root, "existing.txt"), "utf8"), "keep\n");
+
+  mkdirSync(join(env.root, "src"));
+  assert.deepEqual(await create("src/new.txt"), {
+    path: "src/new.txt",
+    sha256: sha256("hello\n"),
+    bytes: 6,
+    created: true,
+  });
+  assert.equal(
+    readFileSync(join(env.root, "src", "new.txt"), "utf8"),
+    "hello\n",
+  );
+  assert.match(
+    (await create("src/new.txt", "again\n")).error,
+    /already exists/,
+  );
+  assert.equal(
+    readFileSync(join(env.root, "src", "new.txt"), "utf8"),
+    "hello\n",
+  );
+  assert.equal(prompts.length, 4);
+  assert.deepEqual(prompts[2].args, {
+    path: "src/new.txt",
+    expectedHash: null,
+    oldText: "",
+    newText: "hello\n",
+    create: true,
+  });
+  assert.deepEqual(readdirSync(env.root).sort(), ["existing.txt", "src"]);
+  assert.deepEqual(readdirSync(join(env.root, "src")), ["new.txt"]);
+});
+
+test("file_read bounds size, rejects binary and invalid UTF-8, and truncates output", async (t) => {
+  const env = setup(t);
+  mkdirSync(join(env.root, "dir"));
+  writeFileSync(join(env.root, "big.txt"), Buffer.alloc(1024 * 1024 + 1, 97));
+  writeFileSync(join(env.root, "zero.dat"), Buffer.from("a\0b"));
+  writeFileSync(join(env.root, "bad.txt"), Buffer.from([0xc3, 0x28]));
+  const medium = "m".repeat(60000);
+  writeFileSync(join(env.root, "medium.txt"), medium);
+  const { run } = tools(env.root, { mode: "plan" });
+  assert.match((await run("file_read", { path: "big.txt" })).error, /1 MiB/);
+  assert.match((await run("file_read", { path: "zero.dat" })).error, /Binary/);
+  assert.ok((await run("file_read", { path: "bad.txt" })).error);
+  assert.ok((await run("file_read", { path: "dir" })).error);
+  assert.ok((await run("file_read", { path: "missing.txt" })).error);
+  const read = await run("file_read", { path: "medium.txt" });
+  assert.equal(read.truncated, true);
+  assert.equal(read.contents.length, 48 * 1024);
+  assert.equal(read.sha256, sha256(medium), "hash covers the full file");
+});
+
+test("file_list is ordered, bounded, and skips protected and dependency directories", async (t) => {
+  const env = setup(t);
+  for (const file of [
+    "b.txt",
+    "a/one.txt",
+    "a/two.txt",
+    "node_modules/pkg/index.js",
+    "dist/out.js",
+    ".git/HEAD",
+    ".rivet/state.db",
+  ]) {
+    mkdirSync(join(env.root, file, ".."), { recursive: true });
+    writeFileSync(join(env.root, file), "x");
+  }
+  const { run } = tools(env.root, { mode: "plan" });
+  assert.deepEqual(await run("file_list", {}), {
+    files: ["a/one.txt", "a/two.txt", "b.txt"],
+    truncated: false,
+  });
+  assert.deepEqual(await run("file_list", { limit: 2 }), {
+    files: ["a/one.txt", "a/two.txt"],
+    truncated: true,
+  });
+  assert.deepEqual(await run("file_list", { path: "a" }), {
+    files: ["a/one.txt", "a/two.txt"],
+    truncated: false,
+  });
+});
+
+test("file_search matches literal text with bounded results", async (t) => {
+  const env = setup(t);
+  for (const [file, contents] of [
+    ["src/a.txt", "abc\na.c\nA.C\n"],
+    ["src/b.bin", "a.c\0"],
+    ["other/c.txt", "first a.c\n"],
+    [".git/config", "a.c\n"],
+  ]) {
+    mkdirSync(join(env.root, file, ".."), { recursive: true });
+    writeFileSync(join(env.root, file), contents);
+  }
+  const { run } = tools(env.root, { mode: "plan" });
+  assert.deepEqual(await run("file_search", { query: "a.c", path: "src" }), {
+    matches: [{ path: "src/a.txt", line: 2, text: "a.c" }],
+    truncated: false,
+  });
+  const all = await run("file_search", { query: "a.c" });
+  assert.equal(all.truncated, false);
+  assert.deepEqual(
+    all.matches.map((match) => `${match.path}:${match.line}`).sort(),
+    ["other/c.txt:1", "src/a.txt:2"],
+  );
+  const limited = await run("file_search", { query: "a.c", limit: 1 });
+  assert.equal(limited.matches.length, 1);
+  assert.equal(limited.truncated, true);
+  assert.deepEqual((await run("file_search", { query: "zzz" })).matches, []);
+});
