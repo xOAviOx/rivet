@@ -202,6 +202,61 @@ test("OpenAI-compatible streams: text deltas, assembled tool calls, usage, reque
   });
 });
 
+test("Gemini-style streams: one-chunk tool calls without an index that finish with stop", async (t) => {
+  const server = await fakeServer(t);
+  const signature = { google: { thought_signature: "sig-1" } };
+  server.on((_entry, res) =>
+    sse(res, [
+      chunk({
+        tool_calls: [
+          {
+            id: "g1",
+            type: "function",
+            function: { name: "file_read", arguments: '{"path":"a.txt"}' },
+            extra_content: signature,
+          },
+        ],
+      }),
+      chunk({}, "stop"),
+      "[DONE]",
+    ]),
+  );
+  const provider = createProvider(server.config(), KEY);
+  const step = (messages) =>
+    provider.step("s", messages, tools, 100, live(), () => {});
+  const result = await step([{ role: "user", content: "hi" }]);
+  assert.deepEqual(result.message, {
+    role: "assistant",
+    content: "",
+    calls: [
+      {
+        id: "g1",
+        name: "file_read",
+        arguments: { path: "a.txt" },
+        extra: signature,
+      },
+    ],
+  });
+  server.on((_entry, res) =>
+    sse(res, [chunk({ content: "ok" }, "stop"), "[DONE]"]),
+  );
+  await step([
+    { role: "user", content: "hi" },
+    result.message,
+    { role: "tool", content: "zzz", callId: "g1" },
+  ]);
+  assert.deepEqual(
+    server.requests.at(-1).body.messages[2].tool_calls[0],
+    {
+      id: "g1",
+      type: "function",
+      function: { name: "file_read", arguments: '{"path":"a.txt"}' },
+      extra_content: signature,
+    },
+    "provider data is replayed unchanged",
+  );
+});
+
 test("OpenAI official endpoint uses max_completion_tokens", async (t) => {
   const server = await fakeServer(t);
   server.on((_entry, res) =>
@@ -481,19 +536,8 @@ test("malformed and incomplete streams are rejected with specific reasons", asyn
     [openaiToolStream("unknown_tool"), /unknown tool or duplicate call ID/],
     [[...openaiToolStream().slice(0, 2), chunk({}, "stop"), "[DONE]"], null],
     [
-      [
-        chunk({
-          tool_calls: [
-            {
-              index: 0,
-              id: "c",
-              function: { name: "file_read", arguments: "{}" },
-            },
-          ],
-        }),
-        chunk({}, "stop"),
-        "[DONE]",
-      ],
+      // A split call whose stream finishes with "stop" is still incomplete.
+      [...openaiToolStream().slice(2, 3), chunk({}, "stop"), "[DONE]"],
       /tool calls without tool completion/,
     ],
     [

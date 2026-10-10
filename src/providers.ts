@@ -14,7 +14,12 @@ const ARG_BYTES = 65536;
 const RESPONSE_BYTES = 16 * 1024 * 1024;
 const TEXT_BYTES = 1024 * 1024;
 type Json = Record<string, unknown>;
-type PendingCall = { id: string; name: string; json: string };
+type PendingCall = {
+  id: string;
+  name: string;
+  json: string;
+  extra?: Record<string, unknown>;
+};
 const object = (value: unknown): Json =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Json)
@@ -131,6 +136,7 @@ function transcript(messages: Message[], config: Config): Json[] {
               name: call.name,
               arguments: JSON.stringify(call.arguments),
             },
+            ...(call.extra ? { extra_content: call.extra } : {}),
           })),
         };
       return { role: message.role, content: message.content };
@@ -297,6 +303,7 @@ async function collect(
     id: unknown,
     name: unknown,
     args: unknown,
+    extra?: unknown,
   ) => {
     const slot = count(index);
     if (slot === undefined || slot >= 128) return invalid("tool index");
@@ -307,6 +314,13 @@ async function collect(
       call = { id: "", name: "", json: "" };
       pending.set(slot, call);
     }
+    if (
+      extra &&
+      typeof extra === "object" &&
+      !Array.isArray(extra) &&
+      !call.extra
+    )
+      call.extra = extra as Record<string, unknown>;
     call.id += string(id);
     call.name += string(name);
     call.json += string(args);
@@ -366,14 +380,43 @@ async function collect(
         if (choice.index !== 0) return invalid("unexpected choice index");
         const delta = object(choice.delta);
         textDelta(delta.content);
-        for (const value of array(delta.tool_calls)) {
+        const calls = array(delta.tool_calls);
+        calls.forEach((value, position) => {
           const call = object(value),
             fn = object(call.function);
-          append(call.index, call.id, fn.name, fn.arguments);
-        }
+          // Gemini's OpenAI stream omits the per-call index. Fall back to the
+          // position in this delta, which is stable for a one-chunk call.
+          append(
+            call.index ?? position,
+            call.id,
+            fn.name,
+            fn.arguments,
+            call.extra_content,
+          );
+        });
         if (choice.finish_reason) {
           finished = true;
           stopReason = string(choice.finish_reason);
+          // Gemini delivers a tool call in one chunk and finishes with "stop".
+          // A split call that ends this way is still incomplete.
+          if (
+            stopReason === "stop" &&
+            pending.size &&
+            [...pending.values()].every((call) => {
+              if (!call.id || !call.name || !call.json) return false;
+              try {
+                const parsed: unknown = JSON.parse(call.json);
+                return (
+                  parsed !== null &&
+                  typeof parsed === "object" &&
+                  !Array.isArray(parsed)
+                );
+              } catch {
+                return false;
+              }
+            })
+          )
+            stopReason = "tool_calls";
         }
       }
     }
@@ -404,6 +447,7 @@ async function collect(
         id: call.id,
         name: call.name,
         arguments: parse(call.json || "{}"),
+        ...(call.extra ? { extra: call.extra } : {}),
       };
     });
   const estimated = input === undefined || output === undefined;

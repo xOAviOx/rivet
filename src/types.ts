@@ -2,6 +2,8 @@ export type ToolCall = {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  /** Provider data that must be replayed unchanged, such as a Gemini thought signature. */
+  extra?: Record<string, unknown>;
 };
 export type Message =
   | { role: "user"; content: string }
