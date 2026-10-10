@@ -2,6 +2,24 @@
   "name": "rivet-agent",
   "version": "0.1.0",
   "description": "A local, permission-controlled terminal coding agent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xOAviOx/rivet.git"
+  },
+  "homepage": "https://github.com/xOAviOx/rivet#readme",
+  "bugs": {
+    "url": "https://github.com/xOAviOx/rivet/issues"
+  },
+  "keywords": [
+    "cli",
+    "coding-agent",
+    "terminal",
+    "llm",
+    "mcp",
+    "openai",
+    "anthropic"
+  ],
   "type": "module",
   "bin": {
     "rivet": "dist/cli.js"

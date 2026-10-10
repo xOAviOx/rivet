@@ -881,7 +881,7 @@ test(
   },
 );
 
-// Regression coverage for the tool-boundary defects recorded in PROGRESS.md.
+// Regression coverage for previously fixed tool-boundary defects.
 
 test("environment and credential files are refused like other protected paths", async (t) => {
   const env = setup(t);
